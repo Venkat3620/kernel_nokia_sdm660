@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -42,6 +42,11 @@
 #define MAX_SSR_REASON_LEN	130U
 #define STOP_ACK_TIMEOUT_MS	1000
 
+/* FIH, to support fih apr { */
+//VNA-3504, add modem failure reason
+char fih_failure_reason[MAX_SSR_REASON_LEN];
+/* FIH, to support fih apr } */
+
 #define subsys_to_drv(d) container_of(d, struct modem_data, subsys_desc)
 
 static void log_modem_sfr(void)
@@ -63,6 +68,12 @@ static void log_modem_sfr(void)
 	strlcpy(reason, smem_reason, min(size, MAX_SSR_REASON_LEN));
 	pr_err("modem subsystem failure reason: %s.\n", reason);
 
+	/* FIH, to support fih apr { */
+	//VNA-3504, add modem failure reason
+	strlcpy(fih_failure_reason, smem_reason, min(size, MAX_SSR_REASON_LEN));
+	//pr_err("fih get failure reason: %s.\n", fih_failure_reason);
+	/* FIH, to support fih apr } */
+
 	smem_reason[0] = '\0';
 	wmb();
 }
@@ -82,7 +93,6 @@ static irqreturn_t modem_err_fatal_intr_handler(int irq, void *dev_id)
 	if (drv->crash_shutdown)
 		return IRQ_HANDLED;
 
-	pr_err("Fatal error on the modem.\n");
 	subsys_set_crash_status(drv->subsys, CRASH_STATUS_ERR_FATAL);
 	restart_modem(drv);
 	return IRQ_HANDLED;
@@ -204,7 +214,10 @@ static int pil_subsys_init(struct modem_data *drv,
 					struct platform_device *pdev)
 {
 	int ret;
-
+	
+	// init the fih_failure_reason.
+	fih_failure_reason[0] = '\0';
+	
 	drv->subsys_desc.name = "modem";
 	drv->subsys_desc.dev = &pdev->dev;
 	drv->subsys_desc.owner = THIS_MODULE;

@@ -33,6 +33,7 @@
 #include <linux/spinlock.h>
 #include <linux/srcu.h>
 #include <linux/wait.h>
+#include <linux/cpumask.h>
 #include <soc/qcom/smem.h>
 #include <soc/qcom/tracer_pkt.h>
 #include "glink_core_if.h"
@@ -222,6 +223,7 @@ struct edge_info {
 	spinlock_t rt_vote_lock;
 	uint32_t rt_votes;
 	uint32_t num_pw_states;
+	uint32_t readback;
 	unsigned long *ramp_time_us;
 	struct mailbox_config_info *mailbox;
 };
@@ -266,6 +268,7 @@ static void send_irq(struct edge_info *einfo)
 	 * Any data associated with this event must be visable to the remote
 	 * before the interrupt is triggered
 	 */
+	einfo->readback = einfo->tx_ch_desc->write_index;
 	wmb();
 	writel_relaxed(einfo->out_irq_mask, einfo->out_irq_reg);
 	einfo->tx_irq_count++;
@@ -835,24 +838,31 @@ static bool get_rx_fifo(struct edge_info *einfo)
  */
 static void tx_wakeup_worker(struct edge_info *einfo)
 {
+	struct glink_transport_if xprt_if = einfo->xprt_if;
 	bool trigger_wakeup = false;
+	bool trigger_resume = false;
 	unsigned long flags;
 
 	if (einfo->in_ssr)
 		return;
-	if (einfo->tx_resume_needed && fifo_write_avail(einfo)) {
-		einfo->tx_resume_needed = false;
-		einfo->xprt_if.glink_core_if_ptr->tx_resume(
-						&einfo->xprt_if);
-	}
+
 	spin_lock_irqsave(&einfo->write_lock, flags);
+	if (fifo_write_avail(einfo)) {
+		if (einfo->tx_blocked_signal_sent)
+			einfo->tx_blocked_signal_sent = false;
+		if (einfo->tx_resume_needed) {
+			einfo->tx_resume_needed = false;
+			trigger_resume = true;
+		}
+	}
 	if (waitqueue_active(&einfo->tx_blocked_queue)) { /* tx waiting ?*/
-		einfo->tx_blocked_signal_sent = false;
 		trigger_wakeup = true;
 	}
 	spin_unlock_irqrestore(&einfo->write_lock, flags);
 	if (trigger_wakeup)
 		wake_up_all(&einfo->tx_blocked_queue);
+	if (trigger_resume)
+		xprt_if.glink_core_if_ptr->tx_resume(&xprt_if);
 }
 
 /**
@@ -888,15 +898,6 @@ static void __rx_worker(struct edge_info *einfo, bool atomic_ctx)
 	void *cmd_data;
 
 	rcu_id = srcu_read_lock(&einfo->use_ref);
-
-	if (unlikely(!einfo->rx_fifo) && atomic_ctx) {
-		if (!get_rx_fifo(einfo)) {
-			srcu_read_unlock(&einfo->use_ref, rcu_id);
-			return;
-		}
-		einfo->in_ssr = false;
-		einfo->xprt_if.glink_core_if_ptr->link_up(&einfo->xprt_if);
-	}
 
 	if (einfo->in_ssr) {
 		srcu_read_unlock(&einfo->use_ref, rcu_id);
@@ -1490,6 +1491,24 @@ static void tx_cmd_ch_remote_close_ack(struct glink_transport_if *if_ptr,
 }
 
 /**
+ * subsys_up() - process a subsystem up notification
+ * @if_ptr:	The transport which is up
+ *
+ */
+static void subsys_up(struct glink_transport_if *if_ptr)
+{
+	struct edge_info *einfo;
+
+	einfo = container_of(if_ptr, struct edge_info, xprt_if);
+	if (!einfo->rx_fifo) {
+		if (!get_rx_fifo(einfo))
+			return;
+		einfo->in_ssr = false;
+		einfo->xprt_if.glink_core_if_ptr->link_up(&einfo->xprt_if);
+	}
+}
+
+/**
  * ssr() - process a subsystem restart notification of a transport
  * @if_ptr:	The transport to restart
  *
@@ -1985,6 +2004,7 @@ static int tx_data(struct glink_transport_if *if_ptr, uint16_t cmd_id,
 	/* Need enough space to write the command and some data */
 	if (size <= sizeof(cmd)) {
 		einfo->tx_resume_needed = true;
+		send_tx_blocked_signal(einfo);
 		spin_unlock_irqrestore(&einfo->write_lock, flags);
 		srcu_read_unlock(&einfo->use_ref, rcu_id);
 		return -EAGAIN;
@@ -2168,6 +2188,7 @@ static void init_xprt_if(struct edge_info *einfo)
 	einfo->xprt_if.tx_cmd_ch_remote_open_ack = tx_cmd_ch_remote_open_ack;
 	einfo->xprt_if.tx_cmd_ch_remote_close_ack = tx_cmd_ch_remote_close_ack;
 	einfo->xprt_if.ssr = ssr;
+	einfo->xprt_if.subsys_up = subsys_up;
 	einfo->xprt_if.allocate_rx_intent = allocate_rx_intent;
 	einfo->xprt_if.deallocate_rx_intent = deallocate_rx_intent;
 	einfo->xprt_if.tx_cmd_local_rx_intent = tx_cmd_local_rx_intent;
@@ -2287,17 +2308,40 @@ static int subsys_name_to_id(const char *name)
 	return -ENODEV;
 }
 
+static void glink_set_affinity(struct edge_info *einfo, u32 *arr, size_t size)
+{
+	struct cpumask cpumask;
+	pid_t pid;
+	int i;
+
+	cpumask_clear(&cpumask);
+	for (i = 0; i < size; i++) {
+		if (arr[i] < num_possible_cpus())
+			cpumask_set_cpu(arr[i], &cpumask);
+	}
+	if (irq_set_affinity(einfo->irq_line, &cpumask))
+		pr_err("%s: Failed to set irq affinity\n", __func__);
+
+	if (sched_setaffinity(einfo->task->pid, &cpumask))
+		pr_err("%s: Failed to set rx cpu affinity\n", __func__);
+
+	pid = einfo->xprt_cfg.tx_task->pid;
+	if (sched_setaffinity(pid, &cpumask))
+		pr_err("%s: Failed to set tx cpu affinity\n", __func__);
+}
+
 static int glink_smem_native_probe(struct platform_device *pdev)
 {
 	struct device_node *node;
 	struct device_node *phandle_node;
 	struct edge_info *einfo;
-	int rc;
+	int rc, cpu_size;
 	char *key;
 	const char *subsys_name;
 	uint32_t irq_line;
 	uint32_t irq_mask;
 	struct resource *r;
+	u32 *cpu_array;
 
 	node = pdev->dev.of_node;
 
@@ -2430,6 +2474,7 @@ static int glink_smem_native_probe(struct platform_device *pdev)
 	}
 
 	einfo->irq_line = irq_line;
+	einfo->in_ssr = true;
 	rc = request_irq(irq_line, irq_handler,
 			IRQF_TRIGGER_RISING | IRQF_NO_SUSPEND | IRQF_SHARED,
 			node->name, einfo);
@@ -2442,6 +2487,20 @@ static int glink_smem_native_probe(struct platform_device *pdev)
 	if (rc < 0)
 		pr_err("%s: enable_irq_wake() failed on %d\n", __func__,
 								irq_line);
+
+	key = "cpu-affinity";
+	cpu_size = of_property_count_u32_elems(node, key);
+	if (cpu_size > 0) {
+		cpu_array = kmalloc_array(cpu_size, sizeof(u32), GFP_KERNEL);
+		if (!cpu_array) {
+			rc = -ENOMEM;
+			goto request_irq_fail;
+		}
+		rc = of_property_read_u32_array(node, key, cpu_array, cpu_size);
+		if (!rc)
+			glink_set_affinity(einfo, cpu_array, cpu_size);
+		kfree(cpu_array);
+	}
 
 	register_debugfs_info(einfo);
 	/* fake an interrupt on this edge to see if the remote side is up */
@@ -2938,6 +2997,7 @@ static int glink_mailbox_probe(struct platform_device *pdev)
 	cfg_p_addr = smem_virt_to_phys(mbox_cfg);
 	writel_relaxed(lower_32_bits(cfg_p_addr), mbox_loc);
 	writel_relaxed(upper_32_bits(cfg_p_addr), mbox_loc + 4);
+	einfo->in_ssr = true;
 	send_irq(einfo);
 	iounmap(mbox_size);
 	iounmap(mbox_loc);
