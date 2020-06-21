@@ -159,6 +159,8 @@ struct sde_kms {
 	bool has_danger_ctrl;
 	void **hdmi_displays;
 	int hdmi_display_count;
+	int shd_display_count;
+	void **shd_displays;
 
 	/* splash handoff structure */
 	struct sde_splash_info splash_info;
@@ -302,6 +304,16 @@ void sde_kms_info_reset(struct sde_kms_info *info);
  * @value: Signed 32-bit integer value
  */
 void sde_kms_info_add_keyint(struct sde_kms_info *info,
+		const char *key,
+		int32_t value);
+
+/**
+ * sde_kms_info_update_keystr - update the special string's value.
+ * @info_str: Pointer to source blob str
+ * @key:      Pointer to key string
+ * @value:    Signed 32-bit integer value
+ */
+void sde_kms_info_update_keystr(char *info_str,
 		const char *key,
 		int32_t value);
 

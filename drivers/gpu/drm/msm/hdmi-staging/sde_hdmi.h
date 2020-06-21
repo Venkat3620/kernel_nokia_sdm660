@@ -103,6 +103,7 @@ enum hdmi_tx_feature_type {
  * @display_lock:     Mutex for sde_hdmi interface.
  * @ctrl:             Controller information for HDMI display.
  * @non_pluggable:    If HDMI display is non pluggable
+ * @display_topology: user requested display topology
  * @num_of_modes:     Number of modes supported by display if non pluggable.
  * @mode_list:        Mode list if non pluggable.
  * @mode:             Current display mode.
@@ -154,6 +155,8 @@ struct sde_hdmi {
 	struct sde_edid_ctrl *edid_ctrl;
 
 	bool non_pluggable;
+	u32 display_topology;
+	bool skip_ddc;
 	u32 num_of_modes;
 	struct list_head mode_list;
 	struct drm_display_mode mode;
@@ -196,6 +199,8 @@ struct sde_hdmi {
 	struct dss_io_data io[HDMI_TX_MAX_IO];
 	/* DEBUG FS */
 	struct dentry *root;
+
+	bool cont_splash_enabled;
 };
 
 /**
@@ -277,6 +282,17 @@ int sde_hdmi_connector_pre_deinit(struct drm_connector *connector,
 		void *display);
 
 /**
+ * sde_hdmi_set_top_ctl()- set display topology control property
+ * @connector: Pointer to drm connector structure
+ * @adj_mode: adjusted mode
+ * @display: Pointer to private display handle
+ *
+ * Return: error code
+ */
+int sde_hdmi_set_top_ctl(struct drm_connector *connector,
+			struct drm_display_mode *adj_mode, void *display);
+
+/**
  * sde_hdmi_connector_post_init()- perform additional initialization steps
  * @connector: Pointer to drm connector structure
  * @info: Pointer to sde connector info structure
@@ -300,6 +316,22 @@ enum drm_connector_status
 sde_hdmi_connector_detect(struct drm_connector *connector,
 		bool force,
 		void *display);
+
+/**
+ * sde_hdmi_core_enable()- turn on clk and pwr for hdmi core
+ * @sde_hdmi: Pointer to sde_hdmi structure
+ *
+ * Return: error code
+ */
+int sde_hdmi_core_enable(struct sde_hdmi *sde_hdmi);
+
+/**
+ * sde_hdmi_core_disable()- turn off clk and pwr for hdmi core
+ * @sde_hdmi: Pointer to sde_hdmi structure
+ *
+ * Return: none
+ */
+void sde_hdmi_core_disable(struct sde_hdmi *sde_hdmi);
 
 /**
  * sde_hdmi_connector_get_modes - add drm modes via drm_mode_probed_add()
@@ -415,10 +447,12 @@ int sde_hdmi_get_property(struct drm_connector *connector,
 /**
  * sde_hdmi_bridge_init() - init sde hdmi bridge
  * @hdmi:          Handle to the hdmi.
+ * @display:       Handle to the sde_hdmi
  *
  * Return: struct drm_bridge *.
  */
-struct drm_bridge *sde_hdmi_bridge_init(struct hdmi *hdmi);
+struct drm_bridge *sde_hdmi_bridge_init(struct hdmi *hdmi,
+			struct sde_hdmi *display);
 
 /**
  * sde_hdmi_set_mode() - Set HDMI mode API.
@@ -545,6 +579,12 @@ static inline int sde_hdmi_get_displays(void **display_array,
 
 static inline int sde_hdmi_connector_pre_deinit(struct drm_connector *connector,
 		void *display)
+{
+	return 0;
+}
+
+static inline int sde_hdmi_set_top_ctl(struct drm_connector *connector,
+		struct drm_display_mode *adj_mode, void *display)
 {
 	return 0;
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2017-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -14,6 +14,8 @@
 #include <linux/of_address.h>
 #include <linux/debugfs.h>
 #include <linux/memblock.h>
+#include <soc/qcom/early_domain.h>
+#include <linux/suspend.h>
 
 #include "msm_drv.h"
 #include "msm_mmu.h"
@@ -22,7 +24,12 @@
 #include "sde_hw_util.h"
 #include "sde_hw_intf.h"
 #include "sde_hw_catalog.h"
+#include "sde_rm.h"
 #include "dsi_display.h"
+#include "sde_hdmi.h"
+#include "sde_crtc.h"
+#include "sde_plane.h"
+#include "sde_shd.h"
 
 #define MDP_SSPP_TOP0_OFF		0x1000
 #define DISP_INTF_SEL			0x004
@@ -34,12 +41,45 @@
 #define SCRATCH_REGISTER_2		0x01C
 
 #define SDE_LK_RUNNING_VALUE		0xC001CAFE
-#define SDE_LK_SHUT_DOWN_VALUE		0xDEADDEAD
+#define SDE_LK_STOP_SPLASH_VALUE	0xDEADDEAD
 #define SDE_LK_EXIT_VALUE		0xDEADBEEF
+#define SDE_LK_INTERMEDIATE_STOP	0xBEEFBEEF
+#define SDE_LK_KERNEL_SPLASH_TALK_LOOP	20
 
-#define SDE_LK_EXIT_MAX_LOOP		20
+#define INTF_HDMI_SEL                  (BIT(25) | BIT(24))
+#define INTF_DSI0_SEL                  BIT(8)
+#define INTF_DSI1_SEL                  BIT(16)
 
 static DEFINE_MUTEX(sde_splash_lock);
+
+static struct splash_pipe_caps splash_pipe_cap[MAX_BLOCKS] = {
+	{SSPP_VIG0, BIT(0), 0x7 << 0, BIT(0)},
+	{SSPP_VIG1, BIT(1), 0x7 << 3, BIT(2)},
+	{SSPP_VIG2, BIT(2), 0x7 << 6, BIT(4)},
+	{SSPP_VIG3, BIT(18), 0x7 << 26, BIT(6)},
+	{SSPP_RGB0, BIT(3), 0x7 << 9, BIT(8)},
+	{SSPP_RGB1, BIT(4), 0x7 << 12, BIT(10)},
+	{SSPP_RGB2, BIT(5), 0x7 << 15, BIT(12)},
+	{SSPP_RGB3, BIT(19), 0x7 << 29, BIT(14)},
+	{SSPP_DMA0, BIT(11), 0x7 << 18, BIT(16)},
+	{SSPP_DMA1, BIT(12), 0x7 << 21, BIT(18)},
+	{SSPP_CURSOR0, 0, 0, 0},
+	{SSPP_CURSOR1, 0, 0, 0},
+};
+
+static inline uint32_t _sde_splash_get_pipe_arrary_index(enum sde_sspp pipe)
+{
+	uint32_t i = 0, index = MAX_BLOCKS;
+
+	for (i = 0; i < MAX_BLOCKS; i++) {
+		if (pipe == splash_pipe_cap[i].pipe) {
+			index = i;
+			break;
+		}
+	}
+
+	return index;
+}
 
 /*
  * In order to free reseved memory from bootup, and we are not
@@ -58,49 +98,6 @@ static void _sde_splash_free_bootup_memory_to_system(phys_addr_t phys,
 
 	for (pfn_idx = pfn_start; pfn_idx < pfn_end; pfn_idx++)
 		free_reserved_page(pfn_to_page(pfn_idx));
-}
-
-static int _sde_splash_parse_dt_get_lk_pool_node(struct drm_device *dev,
-					struct sde_splash_info *sinfo)
-{
-	struct device_node *parent, *node;
-	struct resource r;
-	int ret = 0;
-
-	if (!sinfo)
-		return -EINVAL;
-
-	parent = of_find_node_by_path("/reserved-memory");
-	if (!parent)
-		return -EINVAL;
-
-	node = of_find_node_by_name(parent, "lk_pool");
-	if (!node) {
-		SDE_ERROR("mem reservation for lk_pool is not presented\n");
-		ret = -EINVAL;
-		goto parent_node_err;
-	}
-
-	/* find the mode */
-	if (of_address_to_resource(node, 0, &r)) {
-		ret = -EINVAL;
-		goto child_node_err;
-	}
-
-	sinfo->lk_pool_paddr = (dma_addr_t)r.start;
-	sinfo->lk_pool_size = r.end - r.start;
-
-	DRM_INFO("lk_pool: addr:%pK, size:%pK\n",
-			(void *)sinfo->lk_pool_paddr,
-			(void *)sinfo->lk_pool_size);
-
-child_node_err:
-	of_node_put(node);
-
-parent_node_err:
-	of_node_put(parent);
-
-	return ret;
 }
 
 static int _sde_splash_parse_dt_get_display_node(struct drm_device *dev,
@@ -177,33 +174,47 @@ error:
 	return -ENOMEM;
 }
 
-static bool _sde_splash_lk_check(struct sde_hw_intr *intr)
+static bool _sde_splash_lk_check(void)
 {
-	return (SDE_LK_RUNNING_VALUE == SDE_REG_READ(&intr->hw,
-			SCRATCH_REGISTER_1)) ? true : false;
+	return get_early_service_status(EARLY_DISPLAY);
 }
 
 /**
- * _sde_splash_notify_lk_to_exit.
+ * _sde_splash_notify_lk_stop_splash.
  *
- * Function to monitor LK's status and tell it to exit.
+ * Function to stop early splash in LK.
  */
-static void _sde_splash_notify_lk_exit(struct sde_hw_intr *intr)
+static inline void _sde_splash_notify_lk_stop_splash(void)
 {
 	int i = 0;
+	int32_t *scratch_pad = NULL;
 
-	/* first is to write exit signal to scratch register*/
-	SDE_REG_WRITE(&intr->hw, SCRATCH_REGISTER_1, SDE_LK_SHUT_DOWN_VALUE);
+	/* request Lk to stop splash */
+	request_early_service_shutdown(EARLY_DISPLAY);
 
-	while ((SDE_LK_EXIT_VALUE !=
-		SDE_REG_READ(&intr->hw, SCRATCH_REGISTER_1)) &&
-					(++i < SDE_LK_EXIT_MAX_LOOP)) {
-		DRM_INFO("wait for LK's exit");
-		msleep(20);
+	/*
+	 * Before next proceeding, kernel needs to check bootloader's
+	 * intermediate status to ensure LK's concurrent flush is done.
+	 */
+	while (i++ < SDE_LK_KERNEL_SPLASH_TALK_LOOP) {
+
+		scratch_pad =
+			(int32_t *)get_service_shared_mem_start(EARLY_DISPLAY);
+
+		if (scratch_pad) {
+			if ((*scratch_pad != SDE_LK_INTERMEDIATE_STOP) &&
+				(_sde_splash_lk_check())) {
+				DRM_INFO("wait for LK's intermediate ack\n");
+				msleep(20);
+			} else {
+				SDE_DEBUG("received LK intermediate ack\n");
+				break;
+			}
+		}
 	}
 
-	if (i == SDE_LK_EXIT_MAX_LOOP)
-		SDE_ERROR("Loop LK's exit failed\n");
+	if (i == SDE_LK_KERNEL_SPLASH_TALK_LOOP)
+		SDE_ERROR("Loop talk for LK and Kernel failed\n");
 }
 
 static int _sde_splash_gem_new(struct drm_device *dev,
@@ -283,6 +294,64 @@ static void _sde_splash_destroy_splash_node(struct sde_splash_info *sinfo)
 	sinfo->splash_mem_size = NULL;
 }
 
+static void _sde_splash_update_display_splash_status(struct sde_kms *sde_kms)
+{
+	struct dsi_display *dsi_display;
+	struct sde_hdmi *sde_hdmi;
+	int i = 0;
+
+	for (i = 0; i < sde_kms->dsi_display_count; i++) {
+		dsi_display = (struct dsi_display *)sde_kms->dsi_displays[i];
+
+		dsi_display->cont_splash_enabled = false;
+	}
+
+	for (i = 0; i < sde_kms->hdmi_display_count; i++) {
+		sde_hdmi = (struct sde_hdmi *)sde_kms->hdmi_displays[i];
+
+		sde_hdmi->cont_splash_enabled = false;
+	}
+}
+
+static void _sde_splash_sent_pipe_update_uevent(struct sde_kms *sde_kms)
+{
+	char *event_string;
+	char *envp[2];
+	struct drm_device *dev;
+	struct device *kdev;
+	int i =  0;
+
+	if (!sde_kms || !sde_kms->dev) {
+		DRM_ERROR("invalid input\n");
+		return;
+	}
+
+	dev = sde_kms->dev;
+	kdev = dev->primary->kdev;
+
+	event_string = kzalloc(SZ_4K, GFP_KERNEL);
+	if (!event_string) {
+		SDE_ERROR("failed to allocate event string\n");
+		return;
+	}
+
+	for (i = 0; i < MAX_BLOCKS; i++) {
+		if (sde_kms->splash_info.reserved_pipe_info[i].pipe_id !=
+								0xFFFFFFFF)
+			snprintf(event_string, SZ_4K, "pipe%d avialable",
+			sde_kms->splash_info.reserved_pipe_info[i].pipe_id);
+	}
+
+	DRM_INFO("generating pipe update event[%s]", event_string);
+
+	envp[0] = event_string;
+	envp[1] = NULL;
+
+	kobject_uevent_env(&kdev->kobj, KOBJ_CHANGE, envp);
+
+	kfree(event_string);
+}
+
 static void _sde_splash_get_connector_ref_cnt(struct sde_splash_info *sinfo,
 					u32 *hdmi_cnt, u32 *dsi_cnt)
 {
@@ -292,30 +361,149 @@ static void _sde_splash_get_connector_ref_cnt(struct sde_splash_info *sinfo,
 	mutex_unlock(&sde_splash_lock);
 }
 
-static int _sde_splash_free_resource(struct msm_mmu *mmu,
-		struct sde_splash_info *sinfo, enum splash_connector_type conn)
+static int _sde_splash_free_module_resource(struct msm_mmu *mmu,
+				struct sde_splash_info *sinfo)
 {
-	struct msm_gem_object *msm_obj = to_msm_bo(sinfo->obj[conn]);
+	int i = 0;
+	struct msm_gem_object *msm_obj;
 
-	if (!msm_obj)
-		return -EINVAL;
+	for (i = 0; i < sinfo->splash_mem_num; i++) {
+		msm_obj = to_msm_bo(sinfo->obj[i]);
 
-	if (mmu->funcs && mmu->funcs->unmap)
-		mmu->funcs->unmap(mmu, sinfo->splash_mem_paddr[conn],
-				msm_obj->sgt, NULL);
+		if (!msm_obj)
+			return -EINVAL;
 
-	_sde_splash_free_bootup_memory_to_system(sinfo->splash_mem_paddr[conn],
-						sinfo->splash_mem_size[conn]);
+		if (mmu->funcs && mmu->funcs->early_splash_unmap)
+			mmu->funcs->early_splash_unmap(mmu,
+				sinfo->splash_mem_paddr[i], msm_obj->sgt);
 
-	_sde_splash_destroy_gem_object(msm_obj);
+		_sde_splash_free_bootup_memory_to_system(
+						sinfo->splash_mem_paddr[i],
+						sinfo->splash_mem_size[i]);
+
+		_sde_splash_destroy_gem_object(msm_obj);
+	}
 
 	return 0;
+}
+
+static bool _sde_splash_validate_commit(struct sde_kms *sde_kms,
+					struct drm_atomic_state *state)
+{
+	int i, nplanes;
+	struct drm_plane *plane;
+	struct drm_device *dev = sde_kms->dev;
+
+	nplanes = dev->mode_config.num_total_plane;
+
+	for (i = 0; i < nplanes; i++) {
+		plane = state->planes[i];
+
+		/*
+		 * As plane state has been swapped, we need to check
+		 * fb in state->planes, not fb in state->plane_state.
+		 */
+		if (plane && plane->fb)
+			return true;
+	}
+
+	return false;
+}
+
+static void _sde_splash_update_property(struct sde_kms *sde_kms)
+{
+	struct drm_device *dev = sde_kms->dev;
+	struct drm_crtc *crtc;
+	struct drm_plane *plane;
+	struct sde_mdss_cfg *catalog = sde_kms->catalog;
+
+	/*
+	 * Update plane availability property
+	 * after splash handoff is done.
+	 */
+	drm_for_each_plane(plane, dev) {
+		sde_plane_update_blob_property(plane,
+					"plane_unavailability=", 0);
+	}
+
+	/* update crtc blend stage property */
+	drm_for_each_crtc(crtc, dev)
+		sde_crtc_update_blob_property(crtc, "max_blendstages=",
+					catalog->max_mixer_blendstages);
+}
+
+static void
+_sde_splash_release_early_splash_layer(struct sde_splash_info *splash_info)
+{
+	int i = 0;
+	uint32_t index;
+
+	for (i = 0; i < MAX_BLOCKS; i++) {
+		if (splash_info->reserved_pipe_info[i].early_release) {
+			index = _sde_splash_get_pipe_arrary_index(
+				splash_info->reserved_pipe_info[i].pipe_id);
+			if (index < MAX_BLOCKS) {
+				/*
+				 * Clear flush bits, mixer mask and extension
+				 * mask of released pipes.
+				 */
+				splash_info->flush_bits &=
+					~splash_pipe_cap[index].flush_bit;
+				splash_info->mixer_mask &=
+					~splash_pipe_cap[index].mixer_mask;
+				splash_info->mixer_ext_mask &=
+					~splash_pipe_cap[index].mixer_ext_mask;
+			}
+
+			splash_info->reserved_pipe_info[i].pipe_id =
+								0xFFFFFFFF;
+			splash_info->reserved_pipe_info[i].early_release =
+								false;
+		}
+	}
+}
+
+static bool _sde_splash_check_splash(int connector_type,
+				void *display,
+				bool connector_is_shared)
+{
+	struct dsi_display *dsi_display;
+	struct sde_hdmi *sde_hdmi;
+	struct shd_display *shd_display;
+	bool splash_on = false;
+
+	switch (connector_type) {
+	case DRM_MODE_CONNECTOR_HDMIA:
+		if (connector_is_shared) {
+			shd_display = (struct shd_display *)display;
+			splash_on = shd_display->cont_splash_enabled;
+		} else {
+			sde_hdmi = (struct sde_hdmi *)display;
+			splash_on = sde_hdmi->cont_splash_enabled;
+		}
+		break;
+	case DRM_MODE_CONNECTOR_DSI:
+		if (connector_is_shared) {
+			shd_display = (struct shd_display *)display;
+			splash_on = shd_display->cont_splash_enabled;
+		} else {
+			dsi_display = (struct dsi_display *)display;
+			splash_on = dsi_display->cont_splash_enabled;
+		}
+		break;
+	default:
+		SDE_ERROR("%s:invalid connector_type %d\n",
+		__func__, connector_type);
+	}
+
+	return splash_on;
 }
 
 __ref int sde_splash_init(struct sde_power_handle *phandle, struct msm_kms *kms)
 {
 	struct sde_kms *sde_kms;
 	struct sde_splash_info *sinfo;
+	int ret = 0;
 	int i = 0;
 
 	if (!phandle || !kms) {
@@ -329,12 +517,13 @@ __ref int sde_splash_init(struct sde_power_handle *phandle, struct msm_kms *kms)
 	sinfo->dsi_connector_cnt = 0;
 	sinfo->hdmi_connector_cnt = 0;
 
+	/* Vote data bus after splash is enabled in bootloader */
 	sde_power_data_bus_bandwidth_ctrl(phandle,
 		sde_kms->core_client, true);
 
 	for (i = 0; i < sinfo->splash_mem_num; i++) {
 		if (!memblock_is_reserved(sinfo->splash_mem_paddr[i])) {
-			SDE_ERROR("failed to reserve memory\n");
+			SDE_ERROR("LK's splash memory is not reserved\n");
 
 			/* withdraw the vote when failed. */
 			sde_power_data_bus_bandwidth_ctrl(phandle,
@@ -344,7 +533,10 @@ __ref int sde_splash_init(struct sde_power_handle *phandle, struct msm_kms *kms)
 		}
 	}
 
-	return 0;
+	ret = sde_rm_read_resource_for_splash(&sde_kms->rm,
+					(void *)sinfo, sde_kms->catalog);
+
+	return ret;
 }
 
 void sde_splash_destroy(struct sde_splash_info *sinfo,
@@ -372,12 +564,12 @@ void sde_splash_destroy(struct sde_splash_info *sinfo,
 }
 
 /*
- * sde_splash_parse_dt.
+ * sde_splash_parse_memory_dt.
  * In the function, it will parse and reserve two kinds of memory node.
  * First is to get the reserved memory for display buffers.
- * Second is to get the memory node LK's code stack is running on.
+ * Second is to get the memory node which LK's heap memory is running on.
  */
-int sde_splash_parse_dt(struct drm_device *dev)
+int sde_splash_parse_memory_dt(struct drm_device *dev)
 {
 	struct msm_drm_private *priv = dev->dev_private;
 	struct sde_kms *sde_kms;
@@ -395,13 +587,107 @@ int sde_splash_parse_dt(struct drm_device *dev)
 		SDE_ERROR("get display node failed\n");
 		return -EINVAL;
 	}
+	return 0;
+}
 
-	if (_sde_splash_parse_dt_get_lk_pool_node(dev, sinfo)) {
-		SDE_ERROR("get LK pool node failed\n");
-		return -EINVAL;
+static inline u32 _sde_splash_parse_sspp_id(struct sde_mdss_cfg *cfg,
+					const char *name)
+{
+	int i;
+
+	for (i = 0; i < cfg->sspp_count; i++) {
+		if (!strcmp(cfg->sspp[i].name, name))
+			return cfg->sspp[i].id;
 	}
 
 	return 0;
+}
+
+int sde_splash_parse_reserved_plane_dt(struct drm_device *dev,
+				struct sde_splash_info *splash_info,
+				struct sde_mdss_cfg *cfg)
+{
+	struct device_node *parent, *node;
+	struct property *prop;
+	const char *cname;
+	int ret = 0, i = 0;
+	uint32_t index;
+
+	if (!splash_info || !cfg)
+		return -EINVAL;
+
+	parent = of_get_child_by_name(dev->dev->of_node,
+			"qcom,sde-reserved-plane");
+	if (!parent)
+		return -EINVAL;
+
+	for (i = 0; i < MAX_BLOCKS; i++) {
+		splash_info->reserved_pipe_info[i].pipe_id = 0xFFFFFFFF;
+		splash_info->reserved_pipe_info[i].early_release = false;
+	}
+
+	/* Reset flush bits and mixer mask of reserved planes */
+	splash_info->flush_bits = 0;
+	splash_info->mixer_mask = 0;
+	splash_info->mixer_ext_mask = 0;
+
+	i = 0;
+	for_each_child_of_node(parent, node) {
+		if (i >= MAX_BLOCKS) {
+			SDE_ERROR("num of nodes(%d) is bigger than max(%d)\n",
+				i, MAX_BLOCKS);
+			ret = -EINVAL;
+			goto parent_node_err;
+		}
+
+		of_property_for_each_string(node, "qcom,plane-name",
+					prop, cname)
+			splash_info->reserved_pipe_info[i].pipe_id =
+					_sde_splash_parse_sspp_id(cfg, cname);
+
+		splash_info->reserved_pipe_info[i].early_release =
+			of_property_read_bool(node, "qcom,pipe-early-release");
+
+		index = _sde_splash_get_pipe_arrary_index(
+				splash_info->reserved_pipe_info[i].pipe_id);
+
+		if (index < MAX_BLOCKS) {
+			splash_info->flush_bits |=
+					splash_pipe_cap[index].flush_bit;
+			splash_info->mixer_mask |=
+					splash_pipe_cap[index].mixer_mask;
+			splash_info->mixer_ext_mask |=
+					splash_pipe_cap[index].mixer_ext_mask;
+		}
+
+		i++;
+	}
+
+parent_node_err:
+	of_node_put(parent);
+
+	return ret;
+}
+
+bool sde_splash_query_plane_is_reserved(struct sde_splash_info *sinfo,
+					uint32_t pipe)
+{
+	int i = 0;
+
+	if (!sinfo)
+		return false;
+
+	/* early return if no splash is enabled */
+	if (!sinfo->handoff)
+		return false;
+
+	for (i = 0; i < MAX_BLOCKS; i++) {
+		if (!sinfo->reserved_pipe_info[i].early_release &&
+			(sinfo->reserved_pipe_info[i].pipe_id == pipe))
+			return true;
+	}
+
+	return false;
 }
 
 int sde_splash_get_handoff_status(struct msm_kms *kms)
@@ -448,17 +734,20 @@ int sde_splash_get_handoff_status(struct msm_kms *kms)
 		 * considered as single display. So decrement
 		 * 'num_of_display_on' by 1
 		 */
-		if (split_display)
+		if (split_display) {
 			num_of_display_on--;
+			sinfo->split_is_enabled = true;
+		}
 	}
 
 	if (num_of_display_on) {
 		sinfo->handoff = true;
-		sinfo->program_scratch_regs = true;
+		sinfo->display_splash_enabled = true;
 		sinfo->lk_is_exited = false;
+		sinfo->intf_sel_status = intf_sel;
 	} else {
 		sinfo->handoff = false;
-		sinfo->program_scratch_regs = false;
+		sinfo->display_splash_enabled = false;
 		sinfo->lk_is_exited = true;
 	}
 
@@ -488,9 +777,10 @@ int sde_splash_smmu_map(struct drm_device *dev, struct msm_mmu *mmu,
 	for (i = 0; i < sinfo->splash_mem_num; i++) {
 		msm_obj = to_msm_bo(sinfo->obj[i]);
 
-		if (mmu->funcs && mmu->funcs->map) {
-			ret = mmu->funcs->map(mmu, sinfo->splash_mem_paddr[i],
-				msm_obj->sgt, IOMMU_READ | IOMMU_NOEXEC, NULL);
+		if (mmu->funcs && mmu->funcs->early_splash_map) {
+			ret = mmu->funcs->early_splash_map(mmu,
+				sinfo->splash_mem_paddr[i], msm_obj->sgt,
+				IOMMU_READ | IOMMU_NOEXEC);
 
 			if (!ret) {
 				SDE_ERROR("Map blk %d @%pK failed.\n",
@@ -503,47 +793,208 @@ int sde_splash_smmu_map(struct drm_device *dev, struct msm_mmu *mmu,
 	return ret ? 0 : -ENOMEM;
 }
 
-void sde_splash_setup_connector_count(struct sde_splash_info *sinfo,
-					int connector_type)
+static bool _sde_splash_get_panel_intf_status(struct sde_splash_info *sinfo,
+			const char *display_name, int connector_type)
 {
-	switch (connector_type) {
-	case DRM_MODE_CONNECTOR_HDMIA:
-		sinfo->hdmi_connector_cnt++;
-		break;
-	case DRM_MODE_CONNECTOR_DSI:
-		sinfo->dsi_connector_cnt++;
-		break;
-	default:
-		SDE_ERROR("invalid connector_type %d\n", connector_type);
+	bool ret = false;
+	int intf_status = 0;
+
+	if (sinfo && sinfo->handoff) {
+		if (connector_type == DRM_MODE_CONNECTOR_DSI) {
+			if (!strcmp(display_name, "dsi_adv_7533_1")) {
+				if (sinfo->intf_sel_status & INTF_DSI0_SEL)
+					ret = true;
+			} else if (!strcmp(display_name, "dsi_adv_7533_2")) {
+				if (sinfo->intf_sel_status & INTF_DSI1_SEL)
+					ret = true;
+			} else
+				DRM_INFO("wrong display name %s\n",
+						display_name);
+		} else if (connector_type == DRM_MODE_CONNECTOR_HDMIA) {
+			intf_status = sinfo->intf_sel_status & INTF_HDMI_SEL;
+				ret = (intf_status == INTF_HDMI_SEL);
+		}
 	}
-}
-
-bool sde_splash_get_lk_complete_status(struct sde_splash_info *sinfo)
-{
-	bool ret = 0;
-
-	mutex_lock(&sde_splash_lock);
-	ret = !sinfo->handoff && !sinfo->lk_is_exited;
-	mutex_unlock(&sde_splash_lock);
 
 	return ret;
 }
 
-int sde_splash_clean_up_free_resource(struct msm_kms *kms,
-				struct sde_power_handle *phandle,
-				int connector_type, void *display)
+int sde_splash_setup_display_resource(struct sde_splash_info *sinfo,
+					void *disp, int connector_type,
+					bool display_is_shared)
+{
+	struct dsi_display *dsi_display;
+	struct sde_hdmi *sde_hdmi;
+	struct shd_display *shd_display;
+	bool splash_is_on;
+
+	if (!sinfo || !disp)
+		return -EINVAL;
+
+	/* early return if splash is not enabled in bootloader */
+	if (!sinfo->handoff)
+		return 0;
+
+	if (connector_type == DRM_MODE_CONNECTOR_DSI) {
+		if (display_is_shared) {
+			shd_display = (struct shd_display *)disp;
+			shd_display->cont_splash_enabled =
+				_sde_splash_get_panel_intf_status(sinfo,
+					shd_display->name, connector_type);
+			splash_is_on = shd_display->cont_splash_enabled;
+		} else {
+			dsi_display = (struct dsi_display *)disp;
+			dsi_display->cont_splash_enabled =
+				_sde_splash_get_panel_intf_status(sinfo,
+					dsi_display->name,
+					connector_type);
+			splash_is_on = dsi_display->cont_splash_enabled;
+
+			if (dsi_display->cont_splash_enabled) {
+				if (dsi_dsiplay_setup_splash_resource(
+							dsi_display))
+					return -EINVAL;
+			}
+		}
+
+		DRM_INFO("DSI %s splash %s\n",
+			display_is_shared ? "shared" : "normal",
+			splash_is_on ? "enabled" : "disabled");
+	} else if (connector_type == DRM_MODE_CONNECTOR_HDMIA) {
+		if (display_is_shared) {
+			shd_display = (struct shd_display *)disp;
+			shd_display->cont_splash_enabled =
+				_sde_splash_get_panel_intf_status(sinfo,
+					NULL, connector_type);
+			splash_is_on = shd_display->cont_splash_enabled;
+		} else {
+			sde_hdmi = (struct sde_hdmi *)disp;
+			sde_hdmi->cont_splash_enabled =
+				_sde_splash_get_panel_intf_status(sinfo,
+					NULL, connector_type);
+			splash_is_on = sde_hdmi->cont_splash_enabled;
+		}
+
+		DRM_INFO("HDMI %s splash %s\n",
+			display_is_shared ? "shared" : "normal",
+			splash_is_on ? "enabled" : "disabled");
+	}
+
+	return 0;
+}
+
+void sde_splash_setup_connector_count(struct sde_splash_info *sinfo,
+					int connector_type,
+					void *display,
+					bool connector_is_shared)
+{
+	bool splash_on = false;
+
+	if (!sinfo || !display)
+		return;
+
+	splash_on = _sde_splash_check_splash(connector_type,
+				display, connector_is_shared);
+
+	switch (connector_type) {
+	case DRM_MODE_CONNECTOR_HDMIA:
+		if (splash_on)
+			sinfo->hdmi_connector_cnt++;
+		break;
+	case DRM_MODE_CONNECTOR_DSI:
+		if (splash_on)
+			sinfo->dsi_connector_cnt++;
+		break;
+	default:
+		SDE_ERROR("%s:invalid connector_type %d\n",
+			__func__, connector_type);
+	}
+}
+
+void sde_splash_decrease_connector_cnt(struct drm_device *dev,
+			int connector_type, bool splash_on)
+{
+	struct msm_drm_private *priv = dev->dev_private;
+	struct sde_kms *sde_kms;
+	struct sde_splash_info *sinfo;
+
+	if (!priv || !priv->kms) {
+		SDE_ERROR("Invalid kms\n");
+		return;
+	}
+
+	sde_kms = to_sde_kms(priv->kms);
+	sinfo = &sde_kms->splash_info;
+
+	if (!sinfo->handoff || !splash_on)
+		return;
+
+	switch (connector_type) {
+	case DRM_MODE_CONNECTOR_HDMIA:
+		sinfo->hdmi_connector_cnt--;
+		break;
+	case DRM_MODE_CONNECTOR_DSI:
+		sinfo->dsi_connector_cnt--;
+		break;
+	default:
+		SDE_ERROR("%s: invalid connector_type %d\n",
+			__func__, connector_type);
+	}
+}
+
+void sde_splash_get_mixer_mask(struct sde_splash_info *sinfo,
+		bool *splash_on, u32 *mixercfg, u32 *mixercfg_ext)
+{
+	mutex_lock(&sde_splash_lock);
+	*splash_on = sinfo->handoff;
+	*mixercfg = sinfo->mixer_mask;
+	*mixercfg_ext = sinfo->mixer_ext_mask;
+	mutex_unlock(&sde_splash_lock);
+}
+
+bool sde_splash_get_lk_complete_status(struct msm_kms *kms)
+{
+	struct sde_kms *sde_kms = to_sde_kms(kms);
+	struct sde_hw_intr *intr;
+
+	if (!sde_kms || !sde_kms->hw_intr) {
+		SDE_ERROR("invalid kms\n");
+		return false;
+	}
+
+	intr = sde_kms->hw_intr;
+
+	if (sde_kms->splash_info.handoff &&
+		!sde_kms->splash_info.display_splash_enabled &&
+		!sde_kms->splash_info.early_display_enabled &&
+		!_sde_splash_lk_check()) {
+		SDE_DEBUG("LK totally exits\n");
+		return true;
+	}
+
+	return false;
+}
+
+int sde_splash_free_resource(struct msm_kms *kms,
+			struct sde_power_handle *phandle,
+			int connector_type, void *display,
+			bool connector_is_shared)
 {
 	struct sde_kms *sde_kms;
 	struct sde_splash_info *sinfo;
 	struct msm_mmu *mmu;
-	struct dsi_display *dsi_display = display;
+	struct dsi_display *dsi_display;
+	struct sde_hdmi *hdmi_display;
+	struct shd_display *shd_display;
+	const char *disp_type;
 	int ret = 0;
 	int hdmi_conn_count = 0;
 	int dsi_conn_count = 0;
-	static const char *last_commit_display_type = "unknown";
+	static const char *dsi_old_disp_type = "unknown";
+	static const char *hdmi_old_disp_type = "unknown";
 
-	if (!phandle || !kms) {
-		SDE_ERROR("invalid phandle/kms.\n");
+	if (!phandle || !kms || !display) {
+		SDE_ERROR("invalid phandle/kms/display\n");
 		return -EINVAL;
 	}
 
@@ -554,91 +1005,129 @@ int sde_splash_clean_up_free_resource(struct msm_kms *kms,
 		return -EINVAL;
 	}
 
+	/* Get ref count of connector who has early splash. */
 	_sde_splash_get_connector_ref_cnt(sinfo, &hdmi_conn_count,
 						&dsi_conn_count);
 
 	mutex_lock(&sde_splash_lock);
-	if (hdmi_conn_count == 0 && dsi_conn_count == 0 &&
-					!sinfo->lk_is_exited) {
-		/* When both hdmi's and dsi's handoff are finished,
-		 * 1. Destroy splash node objects.
-		 * 2. Release the memory which LK's stack is running on.
-		 * 3. Withdraw AHB data bus bandwidth voting.
-		 */
-		DRM_INFO("HDMI and DSI resource handoff is completed\n");
-
-		sinfo->lk_is_exited = true;
-
-		_sde_splash_destroy_splash_node(sinfo);
-
-		_sde_splash_free_bootup_memory_to_system(sinfo->lk_pool_paddr,
-							sinfo->lk_pool_size);
-
-		sde_power_data_bus_bandwidth_ctrl(phandle,
-				sde_kms->core_client, false);
-
+	if (!sinfo->handoff) {
 		mutex_unlock(&sde_splash_lock);
 		return 0;
 	}
 
-	mmu = sde_kms->aspace[0]->mmu;
+	/*
+	 * Start to free all LK's resource till user commit happens
+	 * on each display which early splash is enabled on.
+	 */
+	if (hdmi_conn_count == 0 && dsi_conn_count == 0) {
+		mmu = sde_kms->aspace[0]->mmu;
+		if (!mmu) {
+			mutex_unlock(&sde_splash_lock);
+			return -EINVAL;
+		}
 
+		/* free HDMI's, DSI's and early camera's reserved memory */
+		_sde_splash_free_module_resource(mmu, sinfo);
+
+		_sde_splash_destroy_splash_node(sinfo);
+
+		/* withdraw data bus vote */
+		sde_power_data_bus_bandwidth_ctrl(phandle,
+					sde_kms->core_client, false);
+
+		/*
+		 * Turn off MDP core power to keep power on/off operations
+		 * be matched, as MDP core power is enabled already when
+		 * early splash is enabled.
+		 */
+		sde_power_resource_enable(phandle,
+					sde_kms->core_client, false);
+
+		/* update impacted crtc and plane property by splash */
+		_sde_splash_update_property(sde_kms);
+
+		/* send uevent to notify user to recycle resource */
+		_sde_splash_sent_pipe_update_uevent(sde_kms);
+
+		/* set display's splash status to false after handoff is done */
+		_sde_splash_update_display_splash_status(sde_kms);
+
+		/* Reset flush_bits and mixer mask */
+		sinfo->flush_bits = 0;
+		sinfo->mixer_mask = 0;
+		sinfo->mixer_ext_mask = 0;
+
+		/* Finally mark handoff flag to false to say
+		 * handoff is complete.
+		 */
+		sinfo->handoff = false;
+
+		DRM_INFO("HDMI and DSI resource handoff is completed\n");
+		mutex_unlock(&sde_splash_lock);
+		return 0;
+	}
+
+	/*
+	 * Ensure user commit happens on different connectors
+	 * who has splash.
+	 */
 	switch (connector_type) {
 	case DRM_MODE_CONNECTOR_HDMIA:
-		if (sinfo->hdmi_connector_cnt == 1) {
-			sinfo->hdmi_connector_cnt--;
+		if (connector_is_shared) {
+			shd_display = (struct shd_display *)display;
+			disp_type = shd_display->display_type;
+		} else {
+			hdmi_display = (struct sde_hdmi *)display;
+			disp_type = hdmi_display->display_type;
+		}
 
-			ret = _sde_splash_free_resource(mmu,
-					sinfo, SPLASH_HDMI);
+		if (strcmp(disp_type, "unknown") &&
+			strcmp(hdmi_old_disp_type, disp_type)) {
+			if (sinfo->hdmi_connector_cnt >= 1)
+				sinfo->hdmi_connector_cnt--;
+
+			hdmi_old_disp_type = disp_type;
 		}
 		break;
 	case DRM_MODE_CONNECTOR_DSI:
-		/*
-		 * Basically, we have commits coming on two DSI connectors.
-		 * So when releasing DSI resource, it's ensured that the
-		 * coming commits should happen on different DSIs, to promise
-		 * the handoff has finished on the two DSIs, then it's safe
-		 * to release DSI resource, otherwise, problem happens when
-		 * freeing memory, while DSI0 or DSI1 is still visiting
-		 * the memory.
-		 */
-		if (strcmp(dsi_display->display_type, "unknown") &&
-			strcmp(last_commit_display_type,
-					dsi_display->display_type)) {
-			if (sinfo->dsi_connector_cnt > 1)
-				sinfo->dsi_connector_cnt--;
-			else if (sinfo->dsi_connector_cnt == 1) {
-				ret = _sde_splash_free_resource(mmu,
-					sinfo, SPLASH_DSI);
+		if (connector_is_shared) {
+			shd_display = (struct shd_display *)display;
+			disp_type = shd_display->display_type;
+		} else {
+			dsi_display = (struct dsi_display *)display;
+			disp_type = dsi_display->display_type;
+		}
 
+		if (strcmp(disp_type, "unknown") &&
+			strcmp(dsi_old_disp_type, disp_type)) {
+			if (sinfo->dsi_connector_cnt >= 1)
 				sinfo->dsi_connector_cnt--;
-			}
 
-			last_commit_display_type = dsi_display->display_type;
+			dsi_old_disp_type = disp_type;
 		}
 		break;
 	default:
 		ret = -EINVAL;
 		SDE_ERROR("%s: invalid connector_type %d\n",
-				__func__, connector_type);
+					__func__, connector_type);
 	}
 
 	mutex_unlock(&sde_splash_lock);
-
 	return ret;
 }
 
 /*
- * In below function, it will
- * 1. Notify LK to exit and wait for exiting is done.
- * 2. Set DOMAIN_ATTR_EARLY_MAP to 1 to enable stage 1 translation in iommu.
+ * Below function will detach all the pipes of the mixer
  */
-int sde_splash_clean_up_exit_lk(struct msm_kms *kms)
+static int _sde_splash_clear_mixer_blendstage(struct msm_kms *kms,
+				struct drm_atomic_state *state)
 {
+	struct drm_crtc *crtc;
+	struct sde_crtc *sde_crtc;
+	struct sde_crtc_mixer *mixer;
+	int i;
 	struct sde_splash_info *sinfo;
-	struct msm_mmu *mmu;
 	struct sde_kms *sde_kms = to_sde_kms(kms);
-	int ret;
 
 	sinfo = &sde_kms->splash_info;
 
@@ -647,36 +1136,69 @@ int sde_splash_clean_up_exit_lk(struct msm_kms *kms)
 		return -EINVAL;
 	}
 
+	for (i = 0; i < state->dev->mode_config.num_crtc; i++) {
+		crtc = state->crtcs[i];
+		if (!crtc) {
+			SDE_ERROR("CRTC is NULL");
+			continue;
+		}
+		sde_crtc = to_sde_crtc(crtc);
+		if (!sde_crtc) {
+			SDE_ERROR("SDE CRTC is NULL");
+			return -EINVAL;
+		}
+		mixer = sde_crtc->mixers;
+		if (!mixer) {
+			SDE_ERROR("Mixer is NULL");
+			return -EINVAL;
+		}
+		for (i = 0; i < sde_crtc->num_mixers; i++) {
+			if (mixer[i].hw_ctl->ops.clear_all_blendstages)
+				mixer[i].hw_ctl->ops.clear_all_blendstages(
+						mixer[i].hw_ctl,
+						sinfo->handoff,
+						sinfo->mixer_mask,
+						sinfo->mixer_ext_mask);
+		}
+	}
+	return 0;
+}
+
+/*
+ * Below function will notify LK to stop display splash.
+ */
+int sde_splash_lk_stop_splash(struct msm_kms *kms,
+				struct drm_atomic_state *state)
+{
+	int error = 0;
+	struct sde_splash_info *sinfo;
+	struct sde_kms *sde_kms = to_sde_kms(kms);
+
+	sinfo = &sde_kms->splash_info;
+
 	/* Monitor LK's status and tell it to exit. */
 	mutex_lock(&sde_splash_lock);
-	if (sinfo->program_scratch_regs) {
-		if (_sde_splash_lk_check(sde_kms->hw_intr))
-			_sde_splash_notify_lk_exit(sde_kms->hw_intr);
+	if (_sde_splash_validate_commit(sde_kms, state) &&
+			sinfo->display_splash_enabled) {
+		/* release splash RGB layer */
+		_sde_splash_release_early_splash_layer(sinfo);
 
-		sinfo->handoff = false;
-		sinfo->program_scratch_regs = false;
+		if (_sde_splash_lk_check()) {
+			_sde_splash_notify_lk_stop_splash();
+			error = _sde_splash_clear_mixer_blendstage(kms, state);
+		}
+
+		if (get_hibernation_status() == true) {
+			sinfo->display_splash_enabled = false;
+		} else {
+			/* preserve the display_splash_enabled state for
+			 * case when system is restoring from hibernation
+			 * image and splash is enabled.
+			 */
+			sinfo->display_splash_enabled = true;
+		}
 	}
 	mutex_unlock(&sde_splash_lock);
 
-	if (!sde_kms->aspace[0] || !sde_kms->aspace[0]->mmu) {
-		/* We do not return fault value here, to ensure
-		 * flag "lk_is_exited" is set.
-		 */
-		SDE_ERROR("invalid mmu\n");
-		WARN_ON(1);
-	} else {
-		mmu = sde_kms->aspace[0]->mmu;
-		/* After LK has exited, set early domain map attribute
-		 * to 1 to enable stage 1 translation in iommu driver.
-		 */
-		if (mmu->funcs && mmu->funcs->set_property) {
-			ret = mmu->funcs->set_property(mmu,
-				DOMAIN_ATTR_EARLY_MAP, &sinfo->handoff);
-
-			if (ret)
-				SDE_ERROR("set_property failed\n");
-		}
-	}
-
-	return 0;
+	return error;
 }

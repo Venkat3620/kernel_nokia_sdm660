@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2019, The Linux Foundation. All rights reserved.
  * Copyright (C) 2013 Red Hat
  * Author: Rob Clark <robdclark@gmail.com>
  *
@@ -15,6 +15,27 @@
  * You should have received a copy of the GNU General Public License along with
  * this program.  If not, see <http://www.gnu.org/licenses/>.
  */
+/*
+ * Copyright (c) 2016 Intel Corporation
+ *
+ * Permission to use, copy, modify, distribute, and sell this software and its
+ * documentation for any purpose is hereby granted without fee, provided that
+ * the above copyright notice appear in all copies and that both that copyright
+ * notice and this permission notice appear in supporting documentation, and
+ * that the name of the copyright holders not be used in advertising or
+ * publicity pertaining to distribution of the software without specific,
+ * written prior permission. The copyright holders make no representations
+ * about the suitability of this software for any purpose. It is provided "as
+ * is" without express or implied warranty.
+ *
+ * THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS SOFTWARE,
+ * INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS, IN NO
+ * EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY SPECIAL, INDIRECT OR
+ * CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
+ * DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+ * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE
+ * OF THIS SOFTWARE.
+ */
 
 #include <linux/of_address.h>
 #include "msm_drv.h"
@@ -25,6 +46,9 @@
 #define TEARDOWN_DEADLOCK_RETRY_MAX 5
 #include "msm_gem.h"
 #include "msm_mmu.h"
+
+static struct completion wait_display_completion;
+static bool msm_drm_probed;
 
 static void msm_drm_helper_hotplug_event(struct drm_device *dev)
 {
@@ -186,12 +210,16 @@ static void vblank_ctrl_worker(struct kthread_work *work)
 	struct msm_kms *kms = priv->kms;
 	struct vblank_event *vbl_ev, *tmp;
 	unsigned long flags;
+	LIST_HEAD(tmp_head);
 
 	spin_lock_irqsave(&vbl_ctrl->lock, flags);
 	list_for_each_entry_safe(vbl_ev, tmp, &vbl_ctrl->event_list, node) {
 		list_del(&vbl_ev->node);
-		spin_unlock_irqrestore(&vbl_ctrl->lock, flags);
+		list_add_tail(&vbl_ev->node, &tmp_head);
+	}
+	spin_unlock_irqrestore(&vbl_ctrl->lock, flags);
 
+	list_for_each_entry_safe(vbl_ev, tmp, &tmp_head, node) {
 		if (vbl_ev->enable)
 			kms->funcs->enable_vblank(kms,
 						priv->crtcs[vbl_ev->crtc_id]);
@@ -200,11 +228,7 @@ static void vblank_ctrl_worker(struct kthread_work *work)
 						priv->crtcs[vbl_ev->crtc_id]);
 
 		kfree(vbl_ev);
-
-		spin_lock_irqsave(&vbl_ctrl->lock, flags);
 	}
-
-	spin_unlock_irqrestore(&vbl_ctrl->lock, flags);
 }
 
 static int vblank_ctrl_queue_work(struct msm_drm_private *priv,
@@ -281,6 +305,10 @@ static int msm_unload(struct drm_device *dev)
 
 	if (gpu) {
 		mutex_lock(&dev->struct_mutex);
+		/*
+		 * XXX what do we do here?
+		 * pm_runtime_enable(&pdev->dev);
+		 */
 		gpu->funcs->pm_suspend(gpu);
 		mutex_unlock(&dev->struct_mutex);
 		gpu->funcs->destroy(gpu);
@@ -681,10 +709,10 @@ static int msm_open(struct drm_device *dev, struct drm_file *file)
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
 
-	if (ctx)
+	if (ctx) {
 		INIT_LIST_HEAD(&ctx->counters);
-
-	msm_submitqueue_init(ctx);
+		msm_submitqueue_init(ctx);
+	}
 
 	file->driver_priv = ctx;
 
@@ -918,7 +946,9 @@ static int msm_gpu_show(struct drm_device *dev, struct seq_file *m)
 
 	if (gpu) {
 		seq_printf(m, "%s Status:\n", gpu->name);
+		pm_runtime_get_sync(&gpu->pdev->dev);
 		gpu->funcs->show(gpu, m);
+		pm_runtime_put_sync(&gpu->pdev->dev);
 	}
 
 	return 0;
@@ -1839,6 +1869,54 @@ int msm_release(struct inode *inode, struct file *filp)
 	return drm_release(inode, filp);
 }
 
+/**
+ * msm_ioctl_rmfb2 - remove an FB from the configuration
+ * @dev: drm device for the ioctl
+ * @data: data pointer for the ioctl
+ * @file_priv: drm file for the ioctl call
+ *
+ * Remove the FB specified by the user.
+ *
+ * Called by the user via ioctl.
+ *
+ * Returns:
+ * Zero on success, negative errno on failure.
+ */
+static int msm_ioctl_rmfb2(struct drm_device *dev, void *data,
+		    struct drm_file *file_priv)
+{
+	struct drm_framebuffer *fb = NULL;
+	struct drm_framebuffer *fbl = NULL;
+	uint32_t *id = data;
+	int found = 0;
+
+	if (!drm_core_check_feature(dev, DRIVER_MODESET))
+		return -EINVAL;
+
+	fb = drm_framebuffer_lookup(dev, *id);
+	if (!fb)
+		return -ENOENT;
+
+	/* drop extra ref from traversing drm_framebuffer_lookup */
+	drm_framebuffer_unreference(fb);
+
+	mutex_lock(&file_priv->fbs_lock);
+	list_for_each_entry(fbl, &file_priv->fbs, filp_head)
+		if (fb == fbl)
+			found = 1;
+	if (!found) {
+		mutex_unlock(&file_priv->fbs_lock);
+		return -ENOENT;
+	}
+
+	list_del_init(&fb->filp_head);
+	mutex_unlock(&file_priv->fbs_lock);
+
+	drm_framebuffer_unreference(fb);
+
+	return 0;
+}
+
 static const struct drm_ioctl_desc msm_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(MSM_GET_PARAM,    msm_ioctl_get_param,    DRM_AUTH|DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(MSM_GEM_NEW,      msm_ioctl_gem_new,      DRM_AUTH|DRM_RENDER_ALLOW),
@@ -1868,6 +1946,8 @@ static const struct drm_ioctl_desc msm_ioctls[] = {
 			  DRM_AUTH|DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(MSM_SUBMITQUEUE_QUERY, msm_ioctl_submitqueue_query,
 			  DRM_AUTH|DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(MSM_RMFB2, msm_ioctl_rmfb2,
+			  DRM_CONTROL_ALLOW|DRM_UNLOCKED),
 };
 
 static const struct vm_operations_struct vm_ops = {
@@ -2057,10 +2137,150 @@ static int msm_pm_resume(struct device *dev)
 
 	return 0;
 }
+
+static int msm_pm_freeze(struct device *dev)
+{
+	struct drm_device *ddev;
+	struct drm_crtc *crtc;
+	struct drm_modeset_acquire_ctx *ctx;
+	struct drm_atomic_state *state;
+	struct msm_drm_private *priv;
+	struct msm_kms *kms;
+	int early_display = 0;
+	int ret = 0;
+
+	if (!dev)
+		return -EINVAL;
+
+	ddev = dev_get_drvdata(dev);
+	if (!ddev || !ddev->dev_private)
+		return -EINVAL;
+
+	priv = ddev->dev_private;
+
+	kms = priv->kms;
+	if (kms && kms->funcs && kms->funcs->early_display_status)
+		early_display = kms->funcs->early_display_status(kms);
+
+	SDE_EVT32(0);
+
+	if (early_display) {
+		/* acquire modeset lock(s) */
+		drm_modeset_lock_all(ddev);
+		ctx = ddev->mode_config.acquire_ctx;
+
+		/* save current state for restore */
+		if (priv->suspend_state)
+			drm_atomic_state_free(priv->suspend_state);
+
+		priv->suspend_state =
+			drm_atomic_helper_duplicate_state(ddev, ctx);
+
+		if (IS_ERR_OR_NULL(priv->suspend_state)) {
+			DRM_ERROR("failed to back up suspend state\n");
+			priv->suspend_state = NULL;
+			goto unlock;
+		}
+
+		/* create atomic null state to idle CRTCs */
+		state = drm_atomic_state_alloc(ddev);
+		if (IS_ERR_OR_NULL(state)) {
+			DRM_ERROR("failed to allocate null atomic state\n");
+			goto unlock;
+		}
+
+		state->acquire_ctx = ctx;
+
+		/* commit the null state */
+		ret = drm_atomic_commit(state);
+		if (ret < 0) {
+			DRM_ERROR("failed to commit null state, %d\n", ret);
+			drm_atomic_state_free(state);
+		}
+
+		drm_for_each_crtc(crtc, ddev)
+			drm_crtc_vblank_off(crtc);
+
+unlock:
+		drm_modeset_unlock_all(ddev);
+	} else {
+		ret = msm_pm_suspend(dev);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int msm_pm_restore(struct device *dev)
+{
+	struct drm_device *ddev;
+	struct drm_crtc *crtc;
+	struct msm_drm_private *priv;
+	struct msm_kms *kms;
+	int early_display = 0;
+	int ret;
+
+	if (!dev)
+		return -EINVAL;
+
+	ddev = dev_get_drvdata(dev);
+	if (!ddev || !ddev->dev_private)
+		return -EINVAL;
+
+	priv = ddev->dev_private;
+
+	kms = priv->kms;
+	if (kms && kms->funcs && kms->funcs->early_display_status)
+		early_display = kms->funcs->early_display_status(kms);
+
+
+	SDE_EVT32(priv->suspend_state != NULL);
+
+	if (early_display) {
+		drm_mode_config_reset(ddev);
+
+		drm_modeset_lock_all(ddev);
+
+		drm_for_each_crtc(crtc, ddev)
+			drm_crtc_vblank_on(crtc);
+
+		if (priv->suspend_state) {
+			priv->suspend_state->acquire_ctx =
+				ddev->mode_config.acquire_ctx;
+
+			ret = drm_atomic_commit(priv->suspend_state);
+			if (ret < 0) {
+				DRM_ERROR("failed to restore state, %d\n", ret);
+				drm_atomic_state_free(priv->suspend_state);
+			}
+
+			priv->suspend_state = NULL;
+		}
+
+		drm_modeset_unlock_all(ddev);
+	} else {
+		ret = msm_pm_resume(dev);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int msm_pm_thaw(struct device *dev)
+{
+	msm_pm_restore(dev);
+
+	return 0;
+}
 #endif
 
 static const struct dev_pm_ops msm_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(msm_pm_suspend, msm_pm_resume)
+	.suspend = msm_pm_suspend,
+	.resume = msm_pm_resume,
+	.freeze = msm_pm_freeze,
+	.restore = msm_pm_restore,
+	.thaw = msm_pm_thaw,
 };
 
 static int msm_drm_bind(struct device *dev)
@@ -2150,9 +2370,13 @@ static int msm_pdev_probe(struct platform_device *pdev)
 	int ret;
 	struct component_match *match = NULL;
 
+	msm_drm_probed = true;
+
 #ifdef CONFIG_OF
 	add_components(&pdev->dev, &match, "connectors");
+#ifndef CONFIG_QCOM_KGSL
 	add_components(&pdev->dev, &match, "gpus");
+#endif
 #else
 	/* For non-DT case, it kinda sucks.  We don't actually have a way
 	 * to know whether or not we are waiting for certain devices (or if
@@ -2187,6 +2411,7 @@ static int msm_pdev_probe(struct platform_device *pdev)
 		return ret;
 
 	ret = msm_add_master_component(&pdev->dev, match);
+	complete(&wait_display_completion);
 
 	return ret;
 }
@@ -2232,6 +2457,20 @@ static const struct of_device_id dt_match[] = {
 };
 MODULE_DEVICE_TABLE(of, dt_match);
 
+static int find_match(struct device *dev, void *data)
+{
+	struct device_driver *drv = data;
+
+	return drv->bus->match(dev, drv);
+}
+
+static bool find_device(struct platform_driver *pdrv)
+{
+	struct device_driver *drv = &pdrv->driver;
+
+	return bus_for_each_dev(drv->bus, NULL, drv, find_match);
+}
+
 static struct platform_driver msm_platform_driver = {
 	.probe      = msm_pdev_probe,
 	.remove     = msm_pdev_remove,
@@ -2263,6 +2502,7 @@ static int __init msm_drm_register(void)
 	msm_edp_register();
 	hdmi_register();
 	adreno_register();
+	init_completion(&wait_display_completion);
 	return platform_driver_register(&msm_platform_driver);
 }
 
@@ -2277,8 +2517,22 @@ static void __exit msm_drm_unregister(void)
 	msm_smmu_driver_cleanup();
 }
 
+static int __init msm_drm_late_register(void)
+{
+	struct platform_driver *pdrv;
+
+	pdrv = &msm_platform_driver;
+	if (msm_drm_probed || find_device(pdrv)) {
+		pr_debug("wait for display probe completion\n");
+		wait_for_completion(&wait_display_completion);
+	}
+	return 0;
+}
+
 module_init(msm_drm_register);
 module_exit(msm_drm_unregister);
+/* init level 7 */
+late_initcall(msm_drm_late_register);
 
 MODULE_AUTHOR("Rob Clark <robdclark@gmail.com");
 MODULE_DESCRIPTION("MSM DRM Driver");

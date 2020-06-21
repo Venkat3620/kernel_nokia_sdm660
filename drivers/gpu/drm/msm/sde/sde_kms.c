@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2019, The Linux Foundation. All rights reserved.
  * Copyright (C) 2013 Red Hat
  * Author: Rob Clark <robdclark@gmail.com>
  *
@@ -28,6 +28,7 @@
 #include "dsi_drm.h"
 #include "sde_wb.h"
 #include "sde_hdmi.h"
+#include "sde_shd.h"
 
 #include "sde_kms.h"
 #include "sde_core_irq.h"
@@ -37,6 +38,7 @@
 #include "sde_encoder.h"
 #include "sde_plane.h"
 #include "sde_crtc.h"
+#include "sde_recovery_manager.h"
 
 #define CREATE_TRACE_POINTS
 #include "sde_trace.h"
@@ -57,6 +59,20 @@
  */
 #define SDE_DEBUGFS_DIR "msm_sde"
 #define SDE_DEBUGFS_HWMASKNAME "hw_log_mask"
+
+static int sde_kms_recovery_callback(int err_code,
+	    struct recovery_client_info *client_info);
+
+static struct recovery_client_info info = {
+	.name = "sde_kms",
+	.recovery_cb = sde_kms_recovery_callback,
+	.err_supported[0] = {SDE_UNDERRUN, 0, 0},
+	.err_supported[1] = {SDE_VSYNC_MISS, 0, 0},
+	.err_supported[2] = {SDE_SMMU_FAULT, 0, 0},
+	.no_of_err = 3,
+	.handle = NULL,
+	.pdata = NULL,
+};
 
 /**
  * sdecustom - enable certain driver customizations for sde clients
@@ -343,10 +359,14 @@ static void sde_kms_prepare_commit(struct msm_kms *kms,
 	struct drm_device *dev = sde_kms->dev;
 	struct msm_drm_private *priv = dev->dev_private;
 
-	if (sde_kms->splash_info.handoff)
-		sde_splash_clean_up_exit_lk(kms);
+	sde_power_resource_enable(&priv->phandle,
+			sde_kms->core_client, true);
 
-	sde_power_resource_enable(&priv->phandle, sde_kms->core_client, true);
+	if (sde_kms->splash_info.handoff &&
+		sde_kms->splash_info.display_splash_enabled)
+		sde_splash_lk_stop_splash(kms, state);
+
+	shd_display_prepare_commit(sde_kms, state);
 }
 
 static void sde_kms_commit(struct msm_kms *kms,
@@ -376,6 +396,9 @@ static void sde_kms_complete_commit(struct msm_kms *kms,
 
 	for_each_crtc_in_state(old_state, crtc, old_crtc_state, i)
 		sde_crtc_complete_commit(crtc, old_crtc_state);
+
+	shd_display_complete_commit(sde_kms, old_state);
+
 	sde_power_resource_enable(&priv->phandle, sde_kms->core_client, false);
 
 	SDE_EVT32(SDE_EVTLOG_FUNC_EXIT);
@@ -385,11 +408,12 @@ static void sde_kms_wait_for_commit_done(struct msm_kms *kms,
 		struct drm_crtc *crtc)
 {
 	struct drm_encoder *encoder;
-	struct drm_device *dev = crtc->dev;
+	struct drm_device *dev;
 	int ret;
 
-	if (!kms || !crtc || !crtc->state) {
-		SDE_ERROR("invalid params\n");
+	dev = crtc->dev;
+	if (!dev) {
+		SDE_ERROR("invalid dev\n");
 		return;
 	}
 
@@ -516,8 +540,25 @@ static int _sde_kms_get_displays(struct sde_kms *sde_kms)
 				sde_kms->hdmi_display_count);
 	}
 
+	/* shd */
+	sde_kms->shd_displays = NULL;
+	sde_kms->shd_display_count = shd_display_get_num_of_displays();
+	if (sde_kms->shd_display_count) {
+		sde_kms->shd_displays = kcalloc(sde_kms->shd_display_count,
+				sizeof(void *), GFP_KERNEL);
+		if (!sde_kms->shd_displays)
+			goto exit_deinit_shd;
+		sde_kms->shd_display_count =
+			shd_display_get_displays(sde_kms->shd_displays,
+					sde_kms->shd_display_count);
+	}
+
 	return 0;
 
+exit_deinit_shd:
+	kfree(sde_kms->shd_displays);
+	sde_kms->shd_display_count = 0;
+	sde_kms->shd_displays = NULL;
 exit_deinit_hdmi:
 	sde_kms->hdmi_display_count = 0;
 	sde_kms->hdmi_displays = NULL;
@@ -575,7 +616,8 @@ static int _sde_kms_setup_displays(struct drm_device *dev,
 		.get_modes =  dsi_connector_get_modes,
 		.mode_valid = dsi_conn_mode_valid,
 		.get_info =   dsi_display_get_info,
-		.set_backlight = dsi_display_set_backlight
+		.set_backlight = dsi_display_set_backlight,
+		.set_topology_ctl = dsi_display_set_top_ctl,
 	};
 	static const struct sde_connector_ops wb_ops = {
 		.post_init =    sde_wb_connector_post_init,
@@ -595,7 +637,15 @@ static int _sde_kms_setup_displays(struct drm_device *dev,
 		.get_property = sde_hdmi_get_property,
 		.pre_kickoff = sde_hdmi_pre_kickoff,
 		.mode_needs_full_range = sde_hdmi_mode_needs_full_range,
-		.get_csc_type = sde_hdmi_get_csc_type
+		.get_csc_type = sde_hdmi_get_csc_type,
+		.set_topology_ctl = sde_hdmi_set_top_ctl,
+	};
+	static const struct sde_connector_ops shd_ops = {
+		.post_init =    shd_connector_post_init,
+		.detect =       shd_connector_detect,
+		.get_modes =    shd_connector_get_modes,
+		.mode_valid =   shd_connector_mode_valid,
+		.get_info =     shd_connector_get_info,
 	};
 	struct msm_display_info info = {0};
 	struct drm_encoder *encoder;
@@ -611,7 +661,8 @@ static int _sde_kms_setup_displays(struct drm_device *dev,
 
 	max_encoders = sde_kms->dsi_display_count +
 		sde_kms->wb_display_count +
-		sde_kms->hdmi_display_count;
+		sde_kms->hdmi_display_count +
+		sde_kms->shd_display_count;
 
 	if (max_encoders > ARRAY_SIZE(priv->encoders)) {
 		max_encoders = ARRAY_SIZE(priv->encoders);
@@ -634,6 +685,15 @@ static int _sde_kms_setup_displays(struct drm_device *dev,
 		encoder = sde_encoder_init(dev, &info);
 		if (IS_ERR_OR_NULL(encoder)) {
 			SDE_ERROR("encoder init failed for dsi %d\n", i);
+			continue;
+		}
+
+		rc = sde_splash_setup_display_resource(&sde_kms->splash_info,
+					display, DRM_MODE_CONNECTOR_DSI, false);
+		if (rc) {
+			SDE_ERROR("dsi %d splash resource setup failed %d\n",
+									i, rc);
+			sde_encoder_destroy(encoder);
 			continue;
 		}
 
@@ -729,6 +789,15 @@ static int _sde_kms_setup_displays(struct drm_device *dev,
 			continue;
 		}
 
+		rc = sde_splash_setup_display_resource(&sde_kms->splash_info,
+				display, DRM_MODE_CONNECTOR_HDMIA, false);
+		if (rc) {
+			SDE_ERROR("hdmi %d splash resource setup failed %d\n",
+									i, rc);
+			sde_encoder_destroy(encoder);
+			continue;
+		}
+
 		rc = sde_hdmi_drm_init(display, encoder);
 		if (rc) {
 			SDE_ERROR("hdmi drm %d init failed, %d\n", i, rc);
@@ -753,6 +822,57 @@ static int _sde_kms_setup_displays(struct drm_device *dev,
 		}
 	}
 
+	/* shd */
+	for (i = 0; i < sde_kms->shd_display_count &&
+			priv->num_encoders < max_encoders; ++i) {
+		display = sde_kms->shd_displays[i];
+		encoder = NULL;
+
+		memset(&info, 0x0, sizeof(info));
+		rc = shd_connector_get_info(&info, display);
+		if (rc) {
+			SDE_ERROR("shd get_info %d failed\n", i);
+			continue;
+		}
+
+		encoder = sde_encoder_init(dev, &info);
+		if (IS_ERR_OR_NULL(encoder)) {
+			SDE_ERROR("shd encoder init failed %d\n", i);
+			continue;
+		}
+
+		rc = sde_splash_setup_display_resource(&sde_kms->splash_info,
+			display, info.intf_type, true);
+		if (rc) {
+			SDE_ERROR("shared %d splash res setup failed %d\n",
+					i, rc);
+			sde_encoder_destroy(encoder);
+			continue;
+		}
+
+		rc = shd_drm_bridge_init(display, encoder);
+		if (rc) {
+			SDE_ERROR("shd bridge %d init failed, %d\n", i, rc);
+			sde_encoder_destroy(encoder);
+			continue;
+		}
+
+		connector = sde_connector_init(dev,
+					encoder,
+					NULL,
+					display,
+					&shd_ops,
+					DRM_CONNECTOR_POLL_HPD,
+					info.intf_type);
+		if (connector) {
+			priv->encoders[priv->num_encoders++] = encoder;
+			priv->connectors[priv->num_connectors++] = connector;
+		} else {
+			SDE_ERROR("shd %d connector init failed\n", i);
+			shd_drm_bridge_deinit(display);
+			sde_encoder_destroy(encoder);
+		}
+	}
 	return 0;
 }
 
@@ -810,6 +930,7 @@ static int _sde_kms_drm_obj_init(struct sde_kms *sde_kms)
 
 	struct msm_drm_private *priv;
 	struct sde_mdss_cfg *catalog;
+	struct sde_splash_info *sinfo;
 
 	int primary_planes_idx, i, ret;
 	int max_crtc_count, max_plane_count;
@@ -822,6 +943,7 @@ static int _sde_kms_drm_obj_init(struct sde_kms *sde_kms)
 	dev = sde_kms->dev;
 	priv = dev->dev_private;
 	catalog = sde_kms->catalog;
+	sinfo = &sde_kms->splash_info;
 
 	ret = sde_core_irq_domain_add(sde_kms);
 	if (ret)
@@ -849,7 +971,7 @@ static int _sde_kms_drm_obj_init(struct sde_kms *sde_kms)
 				primary = false;
 
 			plane = sde_plane_init(dev, catalog->vp[i].id,
-					primary, 1UL << crtc_id, true);
+					primary, 1UL << crtc_id, true, false);
 			if (IS_ERR(plane)) {
 				SDE_ERROR("sde_plane_init failed\n");
 				ret = PTR_ERR(plane);
@@ -867,14 +989,22 @@ static int _sde_kms_drm_obj_init(struct sde_kms *sde_kms)
 
 		for (i = 0; i < max_plane_count; i++) {
 			bool primary = true;
+			bool resv_plane = false;
 
 			if (catalog->sspp[i].features & BIT(SDE_SSPP_CURSOR)
 				|| primary_planes_idx >= max_crtc_count)
 				primary = false;
 
+			if (sde_splash_query_plane_is_reserved(sinfo,
+							catalog->sspp[i].id)) {
+				resv_plane = true;
+				DRM_INFO("pipe%d is reserved\n",
+					catalog->sspp[i].id);
+			}
+
 			plane = sde_plane_init(dev, catalog->sspp[i].id,
 					primary, (1UL << max_crtc_count) - 1,
-					false);
+					false, resv_plane);
 			if (IS_ERR(plane)) {
 				SDE_ERROR("sde_plane_init failed\n");
 				ret = PTR_ERR(plane);
@@ -934,6 +1064,8 @@ static int sde_kms_postinit(struct msm_kms *kms)
 	 * Allow vblank interrupt to be disabled by drm vblank timer.
 	 */
 	dev->vblank_disable_allowed = true;
+
+	shd_display_post_init(sde_kms);
 
 	return 0;
 }
@@ -1031,6 +1163,8 @@ static void sde_kms_destroy(struct msm_kms *kms)
 		return;
 	}
 
+	sde_recovery_client_unregister(info.handle);
+	info.handle = NULL;
 	_sde_kms_hw_destroy(sde_kms, dev->platformdev);
 	kfree(sde_kms);
 }
@@ -1044,6 +1178,13 @@ static void sde_kms_preclose(struct msm_kms *kms, struct drm_file *file)
 
 	for (i = 0; i < priv->num_crtcs; i++)
 		sde_crtc_cancel_pending_flip(priv->crtcs[i], file);
+}
+
+static bool sde_kms_early_display_status(struct msm_kms *kms)
+{
+	struct sde_kms *sde_kms = to_sde_kms(kms);
+
+	return sde_kms->splash_info.handoff;
 }
 
 static const struct msm_kms_funcs kms_funcs = {
@@ -1065,6 +1206,7 @@ static const struct msm_kms_funcs kms_funcs = {
 	.get_format      = sde_get_msm_format,
 	.round_pixclk    = sde_kms_round_pixclk,
 	.destroy         = sde_kms_destroy,
+	.early_display_status = sde_kms_early_display_status,
 };
 
 /* the caller api needs to turn on clock before calling it */
@@ -1093,10 +1235,23 @@ static int _sde_kms_mmu_destroy(struct sde_kms *sde_kms)
 	return 0;
 }
 
+static int sde_smmu_fault_handler(struct iommu_domain *iommu,
+	 struct device *dev, unsigned long iova, int flags, void *arg)
+{
+
+	dev_info(dev, "%s: iova=0x%08lx, flags=0x%x, iommu=%pK\n", __func__,
+			iova, flags, iommu);
+
+	sde_recovery_set_events(SDE_SMMU_FAULT);
+
+	return 0;
+}
+
 static int _sde_kms_mmu_init(struct sde_kms *sde_kms)
 {
 	struct msm_mmu *mmu;
 	int i, ret;
+	int data = 0;
 
 	for (i = 0; i < MSM_SMMU_DOMAIN_MAX; i++) {
 		struct msm_gem_address_space *aspace;
@@ -1109,6 +1264,8 @@ static int _sde_kms_mmu_init(struct sde_kms *sde_kms)
 					ret);
 			continue;
 		}
+
+		msm_smmu_register_fault_handler(mmu, sde_smmu_fault_handler);
 
 		/* Attaching smmu means IOMMU HW starts to work immediately.
 		 * However, display HW in LK is still accessing memory
@@ -1154,6 +1311,20 @@ static int _sde_kms_mmu_init(struct sde_kms *sde_kms)
 					&sde_kms->splash_info);
 			if (ret) {
 				SDE_ERROR("map rsv mem failed: %d\n", ret);
+				msm_gem_address_space_put(aspace);
+				goto fail;
+			}
+
+			/*
+			 * Enable stage 1 smmu after user has finished early
+			 * mapping of splash memory.
+			 */
+			ret = mmu->funcs->set_property(mmu,
+					DOMAIN_ATTR_EARLY_MAP,
+					&data);
+			if (ret) {
+				SDE_ERROR("failed to set map att(%d): %d\n",
+								data, ret);
 				msm_gem_address_space_put(aspace);
 				goto fail;
 			}
@@ -1217,6 +1388,11 @@ static int sde_kms_hw_init(struct msm_kms *kms)
 		SDE_ERROR("invalid kms\n");
 		goto end;
 	}
+
+	rc = sde_recovery_client_register(&info);
+	if (rc)
+		pr_err("%s recovery mgr register failed %d\n",
+							__func__, rc);
 
 	sde_kms = to_sde_kms(kms);
 	dev = sde_kms->dev;
@@ -1335,11 +1511,16 @@ static int sde_kms_hw_init(struct msm_kms *kms)
 	 */
 	sinfo = &sde_kms->splash_info;
 	if (sinfo->handoff) {
-		rc = sde_splash_parse_dt(dev);
+		rc = sde_splash_parse_memory_dt(dev);
 		if (rc) {
-			SDE_ERROR("parse dt for splash info failed: %d\n", rc);
+			SDE_ERROR("parse memory dt failed: %d\n", rc);
 			goto power_error;
 		}
+
+		rc = sde_splash_parse_reserved_plane_dt(dev, sinfo,
+							sde_kms->catalog);
+		if (rc)
+			SDE_ERROR("parse reserved plane dt failed: %d\n", rc);
 
 		sde_splash_init(&priv->phandle, kms);
 	}
@@ -1436,10 +1617,38 @@ end:
 	return rc;
 }
 
+static int sde_kms_recovery_callback(int err_code,
+	    struct recovery_client_info *client_info)
+{
+	int rc = 0;
+
+	switch (err_code) {
+	case SDE_UNDERRUN:
+		pr_debug("%s [SDE_UNDERRUN] error is auto HW receovered\n",
+			__func__);
+		break;
+
+	case SDE_VSYNC_MISS:
+		pr_debug("%s [SDE_VSYNC_MISS] trigger soft reset\n", __func__);
+		break;
+
+	case SDE_SMMU_FAULT:
+		pr_debug("%s [SDE_SMMU_FAULT] trigger soft reset\n", __func__);
+		break;
+
+	default:
+		pr_err("%s error %d undefined\n", __func__, err_code);
+
+	}
+
+	return rc;
+}
+
 struct msm_kms *sde_kms_init(struct drm_device *dev)
 {
 	struct msm_drm_private *priv;
 	struct sde_kms *sde_kms;
+	int rc = 0;
 
 	if (!dev || !dev->dev_private) {
 		SDE_ERROR("drm device node invalid\n");
@@ -1452,6 +1661,13 @@ struct msm_kms *sde_kms_init(struct drm_device *dev)
 	if (!sde_kms) {
 		SDE_ERROR("failed to allocate sde kms\n");
 		return ERR_PTR(-ENOMEM);
+	}
+
+	rc = sde_init_recovery_mgr(dev);
+	if (rc) {
+		SDE_ERROR("Failed SDE recovery mgr Init, err = %d\n", rc);
+		kfree(sde_kms);
+		return ERR_PTR(-EFAULT);
 	}
 
 	msm_kms_init(&sde_kms->base, &kms_funcs);

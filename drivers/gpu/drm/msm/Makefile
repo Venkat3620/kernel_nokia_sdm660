@@ -5,6 +5,7 @@ ccflags-$(CONFIG_DRM_MSM_DSI) += -Idrivers/gpu/drm/msm/dsi
 ccflags-$(CONFIG_SYNC) += -Idrivers/staging/android
 ccflags-$(CONFIG_DRM_MSM_DSI_PLL) += -Idrivers/gpu/drm/msm/dsi
 ccflags-y += -Idrivers/gpu/drm/msm/sde
+ccflags-$(CONFIG_DRM_MSM_EARLY_CARD) += -Idrivers/gpu/drm/msm/ekms
 
 msm_drm-y := \
 	hdmi/hdmi.o \
@@ -49,12 +50,21 @@ msm_drm-y := \
 	sde/sde_color_processing.o \
 	sde/sde_vbif.o \
 	sde/sde_splash.o \
+	sde/sde_recovery_manager.o \
 	sde_dbg.o \
 	sde_dbg_evtlog.o \
 	sde_io_util.o \
 	dba_bridge.o \
 	sde_edid_parser.o \
 	sde_hdcp_1x.o
+
+msm_drm-$(CONFIG_DRM_MSM_EARLY_CARD) += ekms/edrm_kms.o \
+	ekms/edrm_plane.o \
+	ekms/edrm_encoder.o \
+	ekms/edrm_connector.o \
+	ekms/edrm_crtc.o \
+	ekms/edrm_drv.o \
+	ekms/edrm_splash.o
 
 # use drm gpu driver only if qcom_kgsl driver not available
 ifneq ($(CONFIG_QCOM_KGSL),y)
@@ -134,6 +144,9 @@ msm_drm-$(CONFIG_DRM_MSM) += \
 
 msm_drm-$(CONFIG_DRM_SDE_WB) += sde/sde_wb.o \
 	sde/sde_encoder_phys_wb.o
+
+msm_drm-$(CONFIG_DRM_SDE_SHD) += sde/sde_shd.o \
+	sde/sde_encoder_phys_shd.o
 
 msm_drm-$(CONFIG_DRM_MSM) += \
 	msm_atomic.o \

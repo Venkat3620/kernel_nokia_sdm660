@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -288,6 +288,29 @@ static const struct drm_bridge_funcs dsi_bridge_ops = {
 	.mode_set     = dsi_bridge_mode_set,
 };
 
+int dsi_display_set_top_ctl(struct drm_connector *connector,
+			struct drm_display_mode *adj_mode, void *display)
+{
+	int rc = 0;
+	struct dsi_display *dsi_display = (struct dsi_display *)display;
+
+	if (!dsi_display) {
+		SDE_ERROR("dsi_display is NULL\n");
+		return -EINVAL;
+	}
+
+	if (dsi_display->display_topology) {
+		SDE_DEBUG("%s, set display topology %d\n",
+				__func__, dsi_display->display_topology);
+
+		msm_property_set_property(sde_connector_get_propinfo(connector),
+			sde_connector_get_property_values(connector->state),
+			CONNECTOR_PROP_TOPOLOGY_CONTROL,
+			dsi_display->display_topology);
+	}
+	return rc;
+}
+
 int dsi_conn_post_init(struct drm_connector *connector,
 		void *info,
 		void *display)
@@ -439,7 +462,7 @@ int dsi_connector_get_modes(struct drm_connector *connector,
 	rc = dsi_display_get_modes(display, NULL, &count);
 	if (rc) {
 		pr_err("failed to get num of modes, rc=%d\n", rc);
-		goto error;
+		goto end;
 	}
 
 	size = count * sizeof(*modes);

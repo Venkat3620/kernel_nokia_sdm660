@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 The Linux Foundation. All rights reserved.
+/* Copyright (c) 2016-2017 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -30,6 +30,7 @@ struct a5xx_gpu {
 	unsigned long flags;
 
 	struct adreno_gpu base;
+	struct platform_device *pdev;
 
 	struct drm_gem_object *pm4_bo;
 	uint64_t pm4_iova;
@@ -58,7 +59,6 @@ struct a5xx_gpu {
 	uint64_t smmu_info_iova;
 
 	int timestamp_counter;
-	int gpu_busy_counter;
 };
 
 #define to_a5xx_gpu(x) container_of(x, struct a5xx_gpu, base)
@@ -194,5 +194,7 @@ static inline bool a5xx_in_preempt(struct a5xx_gpu *a5xx_gpu)
 }
 
 int a5xx_counters_init(struct adreno_gpu *adreno_gpu);
+void a5xx_counters_save(struct msm_gpu *gpu);
+void a5xx_counters_restore(struct msm_gpu *gpu);
 
 #endif /* __A5XX_GPU_H__ */
