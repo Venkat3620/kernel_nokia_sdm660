@@ -45,7 +45,7 @@ module_param(record_size, ulong, 0400);
 MODULE_PARM_DESC(record_size,
 		"size of each dump done on oops/panic");
 
-static ulong ramoops_console_size = MIN_MEM_SIZE;
+static ulong ramoops_console_size = 256*1024UL;  /* FIH: for pstore */
 module_param_named(console_size, ramoops_console_size, ulong, 0400);
 MODULE_PARM_DESC(console_size, "size of kernel console log");
 
@@ -57,12 +57,12 @@ static ulong ramoops_pmsg_size = MIN_MEM_SIZE;
 module_param_named(pmsg_size, ramoops_pmsg_size, ulong, 0400);
 MODULE_PARM_DESC(pmsg_size, "size of user space message log");
 
-static ulong mem_address;
+static ulong mem_address = 0xACB00000;  /* FIH: for pstore */
 module_param(mem_address, ulong, 0400);
 MODULE_PARM_DESC(mem_address,
 		"start of reserved RAM used to store oops/panic logs");
 
-static ulong mem_size;
+static ulong mem_size = 0x00200000;  /* FIH: for pstore */
 module_param(mem_size, ulong, 0400);
 MODULE_PARM_DESC(mem_size,
 		"size of reserved RAM used to store oops/panic logs");
@@ -434,7 +434,7 @@ static int ramoops_init_przs(struct device *dev, struct ramoops_context *cxt,
 	for (i = 0; i < cxt->max_dump_cnt; i++) {
 		cxt->przs[i] = persistent_ram_new(*paddr, cxt->record_size, 0,
 						  &cxt->ecc_info,
-						  cxt->memtype);
+						  cxt->memtype, 0);
 		if (IS_ERR(cxt->przs[i])) {
 			err = PTR_ERR(cxt->przs[i]);
 			dev_err(dev, "failed to request mem region (0x%zx@0x%llx): %d\n",
@@ -471,7 +471,8 @@ static int ramoops_init_prz(struct device *dev, struct ramoops_context *cxt,
 		return -ENOMEM;
 	}
 
-	*prz = persistent_ram_new(*paddr, sz, sig, &cxt->ecc_info, cxt->memtype);
+	*prz = persistent_ram_new(*paddr, sz, sig, &cxt->ecc_info,
+				  cxt->memtype, 0);
 	if (IS_ERR(*prz)) {
 		int err = PTR_ERR(*prz);
 
