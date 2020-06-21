@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2009-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -26,6 +26,7 @@
 #include "mdss_mdp_hwio.h"
 #include "mdss_debug.h"
 #include "mdss_dsi.h"
+
 
 #define DEFAULT_BASE_REG_CNT 0x100
 #define GROUP_BYTES 4
@@ -245,7 +246,6 @@ static ssize_t panel_debug_base_reg_write(struct file *file,
 
 	if (ctrl_pdata->ctrl_state & CTRL_STATE_PANEL_INIT)
 		mdss_dsi_cmdlist_put(ctrl_pdata, &cmdreq);
-
 	if (mdata->debug_inf.debug_enable_clock)
 		mdata->debug_inf.debug_enable_clock(0);
 
@@ -297,12 +297,12 @@ static ssize_t panel_debug_base_reg_read(struct file *file,
 	panel_reg[0] = dbg->off;
 	mdss_dsi_panel_cmd_read(ctrl_pdata, panel_reg[0], panel_reg[1],
 				NULL, rx_buf, dbg->cnt);
-
 	len = scnprintf(panel_reg_buf, reg_buf_len, "0x%02zx: ", dbg->off);
 
 	for (i = 0; (len < reg_buf_len) && (i < ctrl_pdata->rx_len); i++)
 		len += scnprintf(panel_reg_buf + len, reg_buf_len - len,
 				"0x%02x ", rx_buf[i]);
+
 
 	if (len)
 		panel_reg_buf[len - 1] = '\n';
@@ -1449,6 +1449,9 @@ static inline struct mdss_mdp_misr_map *mdss_misr_get_map(u32 block_id,
 						break;
 					case MDSS_MDP_INTF2:
 						block_id = DISPLAY_MISR_DSI1;
+						break;
+					case MDSS_MDP_INTF3:
+						block_id = DISPLAY_MISR_HDMI;
 						break;
 					default:
 						pr_err("Unmatch INTF for Dual LM single display configuration, INTF:%d\n",

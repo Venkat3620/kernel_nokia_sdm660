@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -25,6 +25,10 @@
 #include "mdss_panel.h"
 #include "mdss_debug.h"
 #include "mdss_mdp_trace.h"
+
+#if defined(CONFIG_PXLW_IRIS3)
+#include "mdss_dsi_iris3.h"
+#endif
 
 /* wait for at least 2 vsyncs for lowest refresh rate (24hz) */
 #define VSYNC_TIMEOUT_US 100000
@@ -1120,6 +1124,7 @@ static void mdss_mdp_video_vsync_intr_done(void *arg)
 	struct mdss_mdp_video_ctx *ctx = ctl->intf_ctx[MASTER_CTX];
 	struct mdss_mdp_vsync_handler *tmp;
 	ktime_t vsync_time;
+	u32 ctl_flush_bits = 0;
 
 	if (!ctx) {
 		pr_err("invalid ctx\n");
@@ -1129,13 +1134,32 @@ static void mdss_mdp_video_vsync_intr_done(void *arg)
 	vsync_time = ktime_get();
 	ctl->vsync_cnt++;
 
+	ctl_flush_bits = mdss_mdp_ctl_read(ctl, MDSS_MDP_REG_CTL_FLUSH);
+
+#if defined(CONFIG_PXLW_IRIS3)
+	if (iris_is_valid_cfg()) {
+		spin_lock(&ctx->vsync_lock);
+		list_for_each_entry(tmp, &ctx->vsync_handlers, list) {
+			tmp->vsync_handler(ctl, vsync_time);
+		}
+		spin_unlock(&ctx->vsync_lock);
+	}
+#endif
+
 	MDSS_XLOG(ctl->num, ctl->vsync_cnt, ctl->vsync_cnt);
 
-	pr_debug("intr ctl=%d vsync cnt=%u vsync_time=%d\n",
-		 ctl->num, ctl->vsync_cnt, (int)ktime_to_ms(vsync_time));
+	MDSS_XLOG(ctl->num, ctl->vsync_cnt, ctl_flush_bits);
+
+	pr_debug("intr ctl=%d vsync cnt=%u vsync_time=%d ctl_flush=%d\n",
+		 ctl->num, ctl->vsync_cnt, (int)ktime_to_ms(vsync_time),
+		 ctl_flush_bits);
 
 	ctx->polling_en = false;
 	complete_all(&ctx->vsync_comp);
+#if defined(CONFIG_PXLW_IRIS3)
+	if (iris_is_valid_cfg())
+		return;
+#endif
 	spin_lock(&ctx->vsync_lock);
 	list_for_each_entry(tmp, &ctx->vsync_handlers, list) {
 		tmp->vsync_handler(ctl, vsync_time);
@@ -1741,6 +1765,12 @@ static int mdss_mdp_video_display(struct mdss_mdp_ctl *ctl, void *arg)
 	if (mdss_mdp_is_lineptr_supported(ctl))
 		mdss_mdp_video_lineptr_ctrl(ctl, true);
 
+#if defined(CONFIG_PXLW_IRIS3)
+	if (iris_is_valid_cfg()) {
+		struct mdss_data_type *mdata = mdss_mdp_get_mdata();
+		mdss_update_reg_bus_vote(mdata->reg_bus_clt, VOTE_INDEX_HIGH);
+	}
+#endif
 	return 0;
 }
 
@@ -1901,7 +1931,7 @@ static void mdss_mdp_fetch_start_config(struct mdss_mdp_video_ctx *ctx,
 
 	mdata = ctl->mdata;
 
-	pinfo->prg_fet = mdss_mdp_get_prefetch_lines(pinfo);
+	pinfo->prg_fet = mdss_mdp_get_prefetch_lines(pinfo, true);
 	if (!pinfo->prg_fet) {
 		pr_debug("programmable fetch is not needed/supported\n");
 
@@ -1920,7 +1950,7 @@ static void mdss_mdp_fetch_start_config(struct mdss_mdp_video_ctx *ctx,
 	 * Fetch should always be outside the active lines. If the fetching
 	 * is programmed within active region, hardware behavior is unknown.
 	 */
-	v_total = mdss_panel_get_vtotal(pinfo);
+	v_total = mdss_panel_get_vtotal_fixed(pinfo);
 	h_total = mdss_panel_get_htotal(pinfo, true);
 
 	fetch_start = (v_total - pinfo->prg_fet) * h_total + 1;
@@ -2458,10 +2488,21 @@ static int mdss_mdp_video_early_wake_up(struct mdss_mdp_ctl *ctl)
 	 * lot of latency rendering the input events useless in preventing the
 	 * idle time out.
 	 */
-	if (ctl->mfd->idle_state == MDSS_FB_IDLE_TIMER_RUNNING) {
-		if (ctl->mfd->idle_time)
+	if ((ctl->mfd->idle_state == MDSS_FB_IDLE_TIMER_RUNNING) ||
+				(ctl->mfd->idle_state == MDSS_FB_IDLE)) {
+		/*
+		 * Modify the idle time so that an idle fallback can be
+		 * triggered for those cases, where we have no update
+		 * despite of a touch event and idle time is 0.
+		 */
+		if (!ctl->mfd->idle_time) {
+			ctl->mfd->idle_time = 70;
+			schedule_delayed_work(&ctl->mfd->idle_notify_work,
+							msecs_to_jiffies(200));
+		} else {
 			mod_delayed_work(system_wq, &ctl->mfd->idle_notify_work,
 					 msecs_to_jiffies(ctl->mfd->idle_time));
+		}
 		pr_debug("Delayed idle time\n");
 	} else {
 		pr_debug("Nothing to done for this state (%d)\n",
