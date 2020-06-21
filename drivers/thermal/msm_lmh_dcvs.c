@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2016-2017, 2019 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -54,7 +54,7 @@
 #define MSM_LIMITS_CLUSTER_0		0x6370302D
 #define MSM_LIMITS_CLUSTER_1		0x6370312D
 
-#define MSM_LIMITS_DOMAIN_MAX		0x444D4158
+#define MSM_LIMIT_FREQ_CAP		0x46434150
 
 #define MSM_LIMITS_HIGH_THRESHOLD_VAL	95000
 #define MSM_LIMITS_ARM_THRESHOLD_VAL	65000
@@ -82,6 +82,7 @@ struct msm_lmh_dcvs_hw {
 	uint32_t affinity;
 	uint32_t temp_limits[LIMITS_TRIP_MAX];
 	struct sensor_threshold default_lo, default_hi;
+	struct thermal_cooling_device *cdev;
 	int irq_num;
 	void *osm_hw_reg;
 	void *int_clr_reg;
@@ -193,34 +194,40 @@ static irqreturn_t lmh_dcvs_handle_isr(int irq, void *data)
 }
 
 static int msm_lmh_dcvs_write(uint32_t node_id, uint32_t fn,
-		uint32_t setting, uint32_t val)
+			      uint32_t setting, uint32_t val, uint32_t val1,
+			      bool enable_val1)
 {
 	int ret;
 	struct scm_desc desc_arg;
 	uint32_t *payload = NULL;
+	uint32_t payload_len;
 
-	payload = kzalloc(sizeof(uint32_t) * 5, GFP_KERNEL);
+	payload_len = ((enable_val1) ? 6 : 5) * sizeof(uint32_t);
+	payload = kcalloc((enable_val1) ? 6 : 5, sizeof(uint32_t), GFP_KERNEL);
 	if (!payload)
 		return -ENOMEM;
 
 	payload[0] = fn; /* algorithm */
 	payload[1] = 0; /* unused sub-algorithm */
 	payload[2] = setting;
-	payload[3] = 1; /* number of values */
+	payload[3] = enable_val1 ? 2 : 1; /* number of values */
 	payload[4] = val;
+	if (enable_val1)
+		payload[5] = val1;
 
 	desc_arg.args[0] = SCM_BUFFER_PHYS(payload);
-	desc_arg.args[1] = sizeof(uint32_t) * 5;
+	desc_arg.args[1] = payload_len;
 	desc_arg.args[2] = MSM_LIMITS_NODE_DCVS;
 	desc_arg.args[3] = node_id;
 	desc_arg.args[4] = 0; /* version */
 	desc_arg.arginfo = SCM_ARGS(5, SCM_RO, SCM_VAL, SCM_VAL,
 					SCM_VAL, SCM_VAL);
 
-	dmac_flush_range(payload, (void *)payload + 5 * (sizeof(uint32_t)));
+	dmac_flush_range(payload, (void *)payload + payload_len);
 	ret = scm_call2(SCM_SIP_FNID(SCM_SVC_LMH, MSM_LIMITS_DCVSH), &desc_arg);
 
 	kfree(payload);
+
 	return ret;
 }
 
@@ -264,7 +271,7 @@ static int lmh_activate_trip(struct thermal_zone_device *dev,
 	case LIMITS_TRIP_LO:
 		ret =  msm_lmh_dcvs_write(hw->affinity,
 				MSM_LIMITS_SUB_FN_THERMAL,
-				MSM_LIMITS_ARM_THRESHOLD, temp);
+				MSM_LIMITS_ARM_THRESHOLD, temp, 0, 0);
 		break;
 	case LIMITS_TRIP_HI:
 		/*
@@ -275,13 +282,13 @@ static int lmh_activate_trip(struct thermal_zone_device *dev,
 			return -EINVAL;
 		ret =  msm_lmh_dcvs_write(hw->affinity,
 				MSM_LIMITS_SUB_FN_THERMAL,
-				MSM_LIMITS_HI_THRESHOLD, temp);
+				MSM_LIMITS_HI_THRESHOLD, temp, 0, 0);
 		if (ret)
 			break;
 		ret =  msm_lmh_dcvs_write(hw->affinity,
 				MSM_LIMITS_SUB_FN_THERMAL,
 				MSM_LIMITS_LOW_THRESHOLD, temp -
-				MSM_LIMITS_LOW_THRESHOLD_OFFSET);
+				MSM_LIMITS_LOW_THRESHOLD_OFFSET, 0, 0);
 		break;
 	default:
 		return -EINVAL;
@@ -346,8 +353,9 @@ static int lmh_set_max_limit(int cpu, u32 freq)
 	if (!hw)
 		return -EINVAL;
 
-	return msm_lmh_dcvs_write(hw->affinity, MSM_LIMITS_SUB_FN_GENERAL,
-				MSM_LIMITS_DOMAIN_MAX, freq);
+	return msm_lmh_dcvs_write(hw->affinity, MSM_LIMITS_SUB_FN_THERMAL,
+				MSM_LIMIT_FREQ_CAP, freq,
+				freq >= hw->max_freq ? 0 : 1, 1);
 }
 
 static int lmh_get_cur_limit(int cpu, unsigned long *freq)
@@ -377,13 +385,38 @@ int msm_lmh_dcvsh_sw_notify(int cpu)
 	return 0;
 }
 
+static int __ref lmh_dcvs_cpu_callback(struct notifier_block *nfb,
+		unsigned long action, void *hcpu)
+{
+	uint32_t cpu = (uintptr_t)hcpu;
+	struct msm_lmh_dcvs_hw *hw = get_dcvsh_hw_from_cpu(cpu);
+
+	if (!hw || hw->cdev)
+		return NOTIFY_OK;
+
+	switch (action & ~CPU_TASKS_FROZEN) {
+	case CPU_ONLINE:
+		hw->cdev = cpufreq_platform_cooling_register(&hw->core_map,
+				&cd_ops);
+		if (IS_ERR_OR_NULL(hw->cdev))
+			hw->cdev = NULL;
+		break;
+	default:
+		break;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block __refdata lmh_dcvs_cpu_notifier = {
+	.notifier_call = lmh_dcvs_cpu_callback,
+};
+
 static int msm_lmh_dcvs_probe(struct platform_device *pdev)
 {
 	int ret;
 	int affinity = -1;
 	struct msm_lmh_dcvs_hw *hw;
 	struct thermal_zone_device *tzdev;
-	struct thermal_cooling_device *cdev;
 	struct device_node *dn = pdev->dev.of_node;
 	struct device_node *cpu_node, *lmh_node;
 	uint32_t id, max_freq, request_reg, clear_reg;
@@ -431,7 +464,7 @@ static int msm_lmh_dcvs_probe(struct platform_device *pdev)
 
 	/* Enable the thermal algorithm early */
 	ret = msm_lmh_dcvs_write(hw->affinity, MSM_LIMITS_SUB_FN_THERMAL,
-		 MSM_LIMITS_ALGO_MODE_ENABLE, 1);
+		 MSM_LIMITS_ALGO_MODE_ENABLE, 1, 0, 0);
 	if (ret)
 		return ret;
 
@@ -458,10 +491,6 @@ static int msm_lmh_dcvs_probe(struct platform_device *pdev)
 	if (IS_ERR_OR_NULL(tzdev))
 		return PTR_ERR(tzdev);
 
-	/* Setup cooling devices to request mitigation states */
-	cdev = cpufreq_platform_cooling_register(&hw->core_map, &cd_ops);
-	if (IS_ERR_OR_NULL(cdev))
-		return PTR_ERR(cdev);
 	/*
 	 * Driver defaults to for low and hi thresholds.
 	 * Since we make a check for hi > lo value, set the hi threshold
@@ -531,8 +560,15 @@ static int msm_lmh_dcvs_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	if (list_empty(&lmh_dcvs_hw_list))
+		register_cpu_notifier(&lmh_dcvs_cpu_notifier);
+
 	INIT_LIST_HEAD(&hw->list);
 	list_add(&hw->list, &lmh_dcvs_hw_list);
+
+	/* Better register explicitly for 1st CPU of each HW */
+	lmh_dcvs_cpu_callback(&lmh_dcvs_cpu_notifier, CPU_ONLINE,
+			(void *)(long)cpumask_first(&hw->core_map));
 
 	return ret;
 }

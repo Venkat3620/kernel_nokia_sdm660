@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -50,6 +50,9 @@
 #include <linux/uaccess.h>
 #include <linux/uio_driver.h>
 #include <linux/io.h>
+#ifdef CONFIG_FIH_APR
+#include <linux/input/qpnp-power-on.h>
+#endif
 
 #include <asm/cacheflush.h>
 
@@ -57,13 +60,15 @@
 #define TRACE_MSM_THERMAL
 #include <trace/trace_thermal.h>
 
+#include "../../drivers/fih/fih_rere.h" 
+
 #define MSM_LIMITS_DCVSH		0x10
 #define MSM_LIMITS_NODE_DCVS		0x44435653
+#define MSM_LIMITS_SUB_FN_THERMAL	0x54484D4C
 #define MSM_LIMITS_SUB_FN_GENERAL	0x47454E00
 #define MSM_LIMITS_SUB_FN_CRNT		0x43524E54
 #define MSM_LIMITS_SUB_FN_REL		0x52454C00
-#define MSM_LIMITS_DOMAIN_MAX		0x444D4158
-#define MSM_LIMITS_DOMAIN_MIN		0x444D494E
+#define MSM_LIMITS_FREQ_CAP		0x46434150
 #define MSM_LIMITS_CLUSTER_0		0x6370302D
 #define MSM_LIMITS_CLUSTER_1		0x6370312D
 #define MSM_LIMITS_ALGO_MODE_ENABLE	0x454E424C
@@ -188,6 +193,7 @@ static bool ocr_nodes_called;
 static bool ocr_probed;
 static bool ocr_reg_init_defer;
 static bool hotplug_enabled;
+static bool interrupt_mode_enable;
 static bool msm_thermal_probed;
 static bool gfx_crit_phase_ctrl_enabled;
 static bool gfx_warm_phase_ctrl_enabled;
@@ -1017,45 +1023,58 @@ static struct notifier_block msm_thermal_cpufreq_notifier = {
 	.notifier_call = msm_thermal_cpufreq_callback,
 };
 
-static int msm_lmh_dcvs_write(uint32_t node_id, uint32_t fn, uint32_t setting,
-				uint32_t val)
+static int msm_lmh_dcvs_write(uint32_t node_id, uint32_t fn,
+			      uint32_t setting, uint32_t val, uint32_t val1,
+			      bool enable_val1)
 {
 	int ret;
 	struct scm_desc desc_arg;
 	uint32_t *payload = NULL;
+	uint32_t payload_len;
 
-	payload = kzalloc(sizeof(uint32_t) * 5, GFP_KERNEL);
+	payload_len = ((enable_val1) ? 6 : 5) * sizeof(uint32_t);
+	payload = kcalloc((enable_val1) ? 6 : 5, sizeof(uint32_t), GFP_KERNEL);
 	if (!payload)
 		return -ENOMEM;
 
-	payload[0] = fn;
+	payload[0] = fn; /* algorithm */
 	payload[1] = 0; /* unused sub-algorithm */
 	payload[2] = setting;
-	payload[3] = 1; /* number of values */
+	payload[3] = enable_val1 ? 2 : 1; /* number of values */
 	payload[4] = val;
+	if (enable_val1)
+		payload[5] = val1;
 
 	desc_arg.args[0] = SCM_BUFFER_PHYS(payload);
-	desc_arg.args[1] = sizeof(uint32_t) * 5;
+	desc_arg.args[1] = payload_len;
 	desc_arg.args[2] = MSM_LIMITS_NODE_DCVS;
 	desc_arg.args[3] = node_id;
 	desc_arg.args[4] = 0; /* version */
 	desc_arg.arginfo = SCM_ARGS(5, SCM_RO, SCM_VAL, SCM_VAL,
 					SCM_VAL, SCM_VAL);
 
-	dmac_flush_range(payload, (void *)payload + 5 * (sizeof(uint32_t)));
+	dmac_flush_range(payload, (void *)payload + payload_len);
 	ret = scm_call2(SCM_SIP_FNID(SCM_SVC_LMH, MSM_LIMITS_DCVSH), &desc_arg);
 
 	kfree(payload);
+
 	return ret;
 }
 
 static int msm_lmh_dcvs_update(int cpu)
 {
 	uint32_t id = cpus[cpu].parent_ptr->cluster_id;
-	uint32_t max_freq = cpus[cpu].limited_max_freq;
-	uint32_t min_freq = cpus[cpu].limited_min_freq;
+	uint32_t max_freq = cpus[cpu].limited_max_freq, hw_max_freq = U32_MAX;
 	uint32_t affinity;
 	int ret;
+
+	/*
+	 * It is better to use max limits of cluster for given
+	 * cpu if cluster mitigation is supported. It ensures that it
+	 * requests aggregated max limits of all cpus in that cluster.
+	 */
+	if (core_ptr)
+		max_freq = cpus[cpu].parent_ptr->limited_max_freq;
 
 	switch (id) {
 	case 0:
@@ -1069,13 +1088,14 @@ static int msm_lmh_dcvs_update(int cpu)
 		return -EINVAL;
 	};
 
-	ret = msm_lmh_dcvs_write(affinity, MSM_LIMITS_SUB_FN_GENERAL,
-					MSM_LIMITS_DOMAIN_MAX, max_freq);
-	if (ret)
-		return ret;
+	if (cpus[cpu].parent_ptr->freq_table)
+		hw_max_freq =
+			cpus[cpu].parent_ptr->freq_table[
+				cpus[cpu].parent_ptr->freq_idx_high].frequency;
 
-	ret = msm_lmh_dcvs_write(affinity, MSM_LIMITS_SUB_FN_GENERAL,
-					MSM_LIMITS_DOMAIN_MIN, min_freq);
+	ret = msm_lmh_dcvs_write(affinity, MSM_LIMITS_SUB_FN_THERMAL,
+					MSM_LIMITS_FREQ_CAP, max_freq,
+					max_freq >= hw_max_freq ? 0 : 1, 1);
 	if (ret)
 		return ret;
 	/*
@@ -1718,23 +1738,23 @@ static int msm_thermal_lmh_dcvs_init(struct platform_device *pdev)
 	 */
 	ret = msm_lmh_dcvs_write(MSM_LIMITS_CLUSTER_0,
 				MSM_LIMITS_SUB_FN_REL,
-				MSM_LIMITS_ALGO_MODE_ENABLE, 1);
+				MSM_LIMITS_ALGO_MODE_ENABLE, 1, 0, 0);
 	if (ret)
 		pr_err("Unable to enable REL algo for cluster0\n");
 	ret = msm_lmh_dcvs_write(MSM_LIMITS_CLUSTER_1,
 				MSM_LIMITS_SUB_FN_REL,
-				MSM_LIMITS_ALGO_MODE_ENABLE, 1);
+				MSM_LIMITS_ALGO_MODE_ENABLE, 1, 0, 0);
 	if (ret)
 		pr_err("Unable to enable REL algo for cluster1\n");
 
 	ret = msm_lmh_dcvs_write(MSM_LIMITS_CLUSTER_0,
 				MSM_LIMITS_SUB_FN_CRNT,
-				MSM_LIMITS_ALGO_MODE_ENABLE, 1);
+				MSM_LIMITS_ALGO_MODE_ENABLE, 1, 0, 0);
 	if (ret)
 		pr_err("Unable enable CRNT algo for cluster0\n");
 	ret = msm_lmh_dcvs_write(MSM_LIMITS_CLUSTER_1,
 				MSM_LIMITS_SUB_FN_CRNT,
-				MSM_LIMITS_ALGO_MODE_ENABLE, 1);
+				MSM_LIMITS_ALGO_MODE_ENABLE, 1, 0, 0);
 	if (ret)
 		pr_err("Unable enable CRNT algo for cluster1\n");
 
@@ -2850,6 +2870,11 @@ static void msm_thermal_bite(int zone_id, int temp)
 	int tsens_id = 0;
 	int ret = 0;
 
+	#ifdef CONFIG_FIH_APR
+	pr_err("FIH_APR: OVER_TAMPERATURE\n");
+	qpnp_pon_set_restart_reason(FIH_RERE_OVER_TAMPERATURE);
+	#endif
+
 	ret = zone_id_to_tsen_id(zone_id, &tsens_id);
 	if (ret < 0) {
 		pr_err("Zone:%d reached temperature:%d. Err = %d System reset\n",
@@ -2891,9 +2916,12 @@ static int do_therm_reset(void)
 			continue;
 		}
 
-		if (temp >= msm_thermal_info.therm_reset_temp_degC)
+		if (temp >= msm_thermal_info.therm_reset_temp_degC) {
+			printk("BBox;%s:(%d:%d)\n", __func__, i, temp);
+			printk("BBox::UEC;22::11\n");
 			msm_thermal_bite(
 			thresh[MSM_THERM_RESET].thresh_list[i].sensor_id, temp);
+		}
 	}
 
 	return ret;
@@ -4919,9 +4947,10 @@ static void __ref disable_msm_thermal(void)
 
 static void interrupt_mode_init(void)
 {
-	if (!msm_thermal_probed)
+	if (!msm_thermal_probed) {
+		interrupt_mode_enable = true;
 		return;
-
+	}
 	if (polling_enabled) {
 		polling_enabled = 0;
 		create_sensor_zone_id_map();
@@ -4997,7 +5026,7 @@ static ssize_t __ref store_cc_enabled(struct kobject *kobj,
 		hotplug_init_cpu_offlined();
 		mutex_lock(&core_control_mutex);
 		update_offline_cores(cpus_offlined);
-		if (hotplug_enabled) {
+		if (hotplug_enabled && hotplug_task) {
 			for_each_possible_cpu(cpu) {
 				if (!(msm_thermal_info.core_control_mask &
 					BIT(cpus[cpu].cpu)))
@@ -6092,6 +6121,13 @@ static int probe_vdd_rstr(struct device_node *node,
 	if (ret)
 		goto read_node_fail;
 
+	/*
+	 * Monitor only this sensor if defined, otherwise monitor all tsens
+	 */
+	key = "qcom,vdd-restriction-sensor-id";
+	if (of_property_read_u32(node, key, &data->vdd_rstr_sensor_id))
+		data->vdd_rstr_sensor_id = MONITOR_ALL_TSENS;
+
 	for_each_child_of_node(node, child_node) {
 		rails_cnt++;
 	}
@@ -6164,7 +6200,7 @@ static int probe_vdd_rstr(struct device_node *node,
 			goto read_node_fail;
 		}
 		ret = sensor_mgr_init_threshold(&thresh[MSM_VDD_RESTRICTION],
-			MONITOR_ALL_TSENS,
+			data->vdd_rstr_sensor_id,
 			data->vdd_rstr_temp_hyst_degC, data->vdd_rstr_temp_degC,
 			vdd_restriction_notify);
 		if (ret) {
@@ -7100,6 +7136,10 @@ static void thermal_vdd_config_read(struct seq_file *m, void *data)
 				msm_thermal_info.vdd_rstr_temp_degC);
 		seq_printf(m, "threshold clear:%d degC\n",
 				msm_thermal_info.vdd_rstr_temp_hyst_degC);
+		if (msm_thermal_info.vdd_rstr_sensor_id != MONITOR_ALL_TSENS)
+			seq_printf(m, "tsens sensor:tsens_tz_sensor%d\n",
+				msm_thermal_info.vdd_rstr_sensor_id);
+
 		for (i = 0; i < rails_cnt; i++) {
 			if (!strcmp(rails[i].name, "vdd-dig")
 				&& rails[i].num_levels)
@@ -7434,6 +7474,10 @@ static int msm_thermal_dev_probe(struct platform_device *pdev)
 	if (ret)
 		goto probe_exit;
 	msm_thermal_probed = true;
+	if (interrupt_mode_enable) {
+		interrupt_mode_init();
+		interrupt_mode_enable = false;
+	}
 
 probe_exit:
 	return ret;
@@ -7570,6 +7614,7 @@ int __init msm_thermal_late_init(void)
 		}
 	}
 	msm_thermal_add_mx_nodes();
+	interrupt_mode_init();
 	create_cpu_topology_sysfs();
 	create_thermal_debugfs();
 	msm_thermal_add_bucket_info_nodes();
