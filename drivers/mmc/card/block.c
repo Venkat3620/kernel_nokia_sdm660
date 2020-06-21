@@ -51,6 +51,11 @@
 
 #include "queue.h"
 
+/* FIH, add for emmcinfo { */
+#include <linux/string.h>
+#include "../../../drivers/fih/fih_emmc.h"
+/* FIH, add for emmcinfo } */
+
 MODULE_ALIAS("mmc:block");
 #ifdef MODULE_PARAM_PREFIX
 #undef MODULE_PARAM_PREFIX
@@ -1048,6 +1053,12 @@ static int mmc_blk_ioctl_rpmb_cmd(struct block_device *bdev,
 		goto idata_free;
 	}
 
+	/*
+	 * Ensure rpmb_req_pending flag is synchronized between multiple
+	 * entities which may use rpmb ioclts with a lock.
+	 */
+	mutex_lock(&card->host->rpmb_req_mutex);
+	atomic_set(&card->host->rpmb_req_pending, 1);
 	mmc_get_card(card);
 
 	if (mmc_card_doing_bkops(card)) {
@@ -1163,6 +1174,9 @@ static int mmc_blk_ioctl_rpmb_cmd(struct block_device *bdev,
 
 cmd_rel_host:
 	mmc_put_card(card);
+	atomic_set(&card->host->rpmb_req_pending, 0);
+	mutex_unlock(&card->host->rpmb_req_mutex);
+
 
 idata_free:
 	for (i = 0; i < MMC_IOC_MAX_RPMB_CMD; i++) {
@@ -1292,8 +1306,25 @@ static int mmc_blk_ioctl_multi_cmd(struct block_device *bdev,
 
 	mmc_get_card(card);
 
+	if (mmc_card_cmdq(card)) {
+		err = mmc_cmdq_halt(card->host, true);
+		if (err) {
+			pr_err("%s: halt failed while doing %s err (%d)\n",
+					mmc_hostname(card->host),
+					__func__, err);
+			mmc_put_card(card);
+			goto cmd_done;
+		}
+	}
+
 	for (i = 0; i < num_of_cmds && !ioc_err; i++)
 		ioc_err = __mmc_blk_ioctl_cmd(card, md, idata[i]);
+
+	if (mmc_card_cmdq(card)) {
+		if (mmc_cmdq_halt(card->host, false))
+			pr_err("%s: %s: cmdq unhalt failed\n",
+			       mmc_hostname(card->host), __func__);
+	}
 
 	mmc_put_card(card);
 
@@ -1619,17 +1650,23 @@ static int mmc_blk_cmd_error(struct request *req, const char *name, int error,
 			"%s: response CRC error sending %s command, card status %#x\n",
 			req->rq_disk->disk_name,
 			name, status);
+		pr_err("BBox;%s: %s sending %s command, card status %#x\n",
+			req->rq_disk->disk_name, "response CRC error",
+			name, status);
 		return ERR_RETRY;
 
 	case -ETIMEDOUT:
 		pr_err_ratelimited(
 			"%s: timed out sending %s command, card status %#x\n",
 			req->rq_disk->disk_name, name, status);
+		pr_err("BBox;%s: %s sending %s command, card status %#x\n",
+			req->rq_disk->disk_name, "timed out", name, status);
 
 		/* If the status cmd initially failed, retry the r/w cmd */
 		if (!status_valid) {
 			pr_err_ratelimited("%s: status not valid, retrying timeout\n",
 				req->rq_disk->disk_name);
+			pr_err("BBox;%s: status not valid, retrying timeout\n", req->rq_disk->disk_name);	
 			return ERR_RETRY;
 		}
 		/*
@@ -1641,6 +1678,7 @@ static int mmc_blk_cmd_error(struct request *req, const char *name, int error,
 			pr_err_ratelimited(
 				"%s: command error, retrying timeout\n",
 				req->rq_disk->disk_name);
+			pr_err("BBox;%s: command error, retrying timeout\n", req->rq_disk->disk_name);
 			return ERR_RETRY;
 		}
 
@@ -1648,12 +1686,15 @@ static int mmc_blk_cmd_error(struct request *req, const char *name, int error,
 		pr_err_ratelimited(
 			"%s: not retrying timeout\n",
 			req->rq_disk->disk_name);
+		pr_err("BBox;%s: not retrying timeout\n", req->rq_disk->disk_name);	
 		return ERR_ABORT;
 
 	default:
 		/* We don't understand the error code the driver gave us */
 		pr_err_ratelimited(
 			"%s: unknown error %d sending read/write command, card status %#x\n",
+		       req->rq_disk->disk_name, error, status);
+		pr_err("BBox;%s: unknown error %d sending read/write command, card status %#x\n",
 		       req->rq_disk->disk_name, error, status);
 		return ERR_ABORT;
 	}
@@ -1702,6 +1743,8 @@ static int mmc_blk_cmd_recovery(struct mmc_card *card, struct request *req,
 
 		prev_cmd_status_valid = false;
 		pr_err_ratelimited("%s: error %d sending status command, %sing\n",
+		       req->rq_disk->disk_name, err, retry ? "retry" : "abort");
+		pr_err("BBox;%s: error %d sending status command, %sing\n",
 		       req->rq_disk->disk_name, err, retry ? "retry" : "abort");
 	}
 
@@ -1772,7 +1815,10 @@ static int mmc_blk_cmd_recovery(struct mmc_card *card, struct request *req,
 	pr_info("%s: error %d sending stop command, original cmd response %#x, card status %#x\n",
 	       req->rq_disk->disk_name, brq->stop.error,
 	       brq->cmd.resp[0], status);
-
+	pr_err("BBox;%s: error %d sending stop command, original cmd response %#x, card status %#x\n",
+	       req->rq_disk->disk_name, brq->stop.error,
+	       brq->cmd.resp[0], status);
+		   
 	/*
 	 * Subsitute in our own stop status as this will give the error
 	 * state which happened during the execution of the r/w command.
@@ -2235,6 +2281,8 @@ static int mmc_blk_err_check(struct mmc_card *card,
 	if (brq->cmd.resp[0] & CMD_ERRORS) {
 		pr_err("%s: r/w command failed, status = %#x\n",
 		       req->rq_disk->disk_name, brq->cmd.resp[0]);
+		pr_err("BBox;%s: r/w command failed, status = %#x\n",
+		       req->rq_disk->disk_name, brq->cmd.resp[0]);
 		return MMC_BLK_ABORT;
 	}
 
@@ -2275,6 +2323,11 @@ static int mmc_blk_err_check(struct mmc_card *card,
 			return MMC_BLK_RETRY;
 		}
 		pr_err("%s: error %d transferring data, sector %u, nr %u, cmd response %#x, card status %#x\n",
+		       req->rq_disk->disk_name, brq->data.error,
+		       (unsigned)blk_rq_pos(req),
+		       (unsigned)blk_rq_sectors(req),
+		       brq->cmd.resp[0], brq->stop.resp[0]);
+		pr_err("BBox;%s: error %d transferring data, sector %u, nr %u, cmd response %#x, card status %#x\n",
 		       req->rq_disk->disk_name, brq->data.error,
 		       (unsigned)blk_rq_pos(req),
 		       (unsigned)blk_rq_sectors(req),
@@ -3173,11 +3226,11 @@ static struct mmc_cmdq_req *mmc_blk_cmdq_rw_prep(
 static void mmc_blk_cmdq_requeue_rw_rq(struct mmc_queue *mq,
 				struct request *req)
 {
-	struct mmc_card *card = mq->card;
-	struct mmc_host *host = card->host;
+	struct request_queue *q = req->q;
 
-	blk_requeue_request(req->q, req);
-	mmc_put_card(host->card);
+	spin_lock_irq(q->queue_lock);
+	blk_requeue_request(q, req);
+	spin_unlock_irq(q->queue_lock);
 }
 
 static int mmc_blk_cmdq_issue_rw_rq(struct mmc_queue *mq, struct request *req)
@@ -3605,7 +3658,7 @@ void mmc_blk_cmdq_complete_rq(struct request *rq)
 	 * or disable state so cannot receive any completion of
 	 * other requests.
 	 */
-	BUG_ON(test_bit(CMDQ_STATE_ERR, &ctx_info->curr_state));
+	WARN_ON(test_bit(CMDQ_STATE_ERR, &ctx_info->curr_state));
 
 	/* clear pending request */
 	BUG_ON(!test_and_clear_bit(cmdq_req->tag,
@@ -3639,7 +3692,7 @@ void mmc_blk_cmdq_complete_rq(struct request *rq)
 out:
 
 	mmc_cmdq_clk_scaling_stop_busy(host, true, is_dcmd);
-	if (!test_bit(CMDQ_STATE_ERR, &ctx_info->curr_state)) {
+	if (!(err || cmdq_req->resp_err)) {
 		mmc_host_clk_release(host);
 		wake_up(&ctx_info->wait);
 		mmc_put_card(host->card);
@@ -3913,6 +3966,7 @@ static inline int mmc_blk_cmdq_part_switch(struct mmc_card *card,
 	struct mmc_host *host = card->host;
 	struct mmc_cmdq_context_info *ctx = &host->cmdq_ctx;
 	u8 part_config = card->ext_csd.part_config;
+	int ret = 0, err = 0;
 
 	if ((main_md->part_curr == md->part_type) &&
 	    (card->part_curr == md->part_type))
@@ -3922,40 +3976,71 @@ static inline int mmc_blk_cmdq_part_switch(struct mmc_card *card,
 		 card->ext_csd.cmdq_support &&
 		 (md->flags & MMC_BLK_CMD_QUEUE)));
 
-	if (!test_bit(CMDQ_STATE_HALT, &ctx->curr_state))
-		WARN_ON(mmc_cmdq_halt(host, true));
+	if (!test_bit(CMDQ_STATE_HALT, &ctx->curr_state)) {
+		ret = mmc_cmdq_halt(host, true);
+		if (ret) {
+			pr_err("%s: %s: halt: failed: %d\n",
+				mmc_hostname(host), __func__,  ret);
+			goto out;
+		}
+	}
 
 	/* disable CQ mode in card */
 	if (mmc_card_cmdq(card)) {
-		WARN_ON(mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+		ret = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
 				 EXT_CSD_CMDQ, 0,
-				  card->ext_csd.generic_cmd6_time));
+				 card->ext_csd.generic_cmd6_time);
+		if (ret) {
+			pr_err("%s: %s: cmdq mode disable failed %d\n",
+				mmc_hostname(host), __func__, ret);
+			goto cmdq_unhalt;
+		}
 		mmc_card_clr_cmdq(card);
 	}
 
 	part_config &= ~EXT_CSD_PART_CONFIG_ACC_MASK;
 	part_config |= md->part_type;
 
-	WARN_ON(mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+	ret = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
 			 EXT_CSD_PART_CONFIG, part_config,
-			  card->ext_csd.part_time));
+			 card->ext_csd.part_time);
+	if (ret) {
+		pr_err("%s: %s: mmc_switch failure, %d -> %d , err = %d\n",
+			mmc_hostname(host), __func__, main_md->part_curr,
+			md->part_type, ret);
+		goto cmdq_switch;
+	}
 
 	card->ext_csd.part_config = part_config;
 	card->part_curr = md->part_type;
 
 	main_md->part_curr = md->part_type;
 
-	WARN_ON(mmc_blk_cmdq_switch(card, md, true));
-	WARN_ON(mmc_cmdq_halt(host, false));
-
-	return 0;
+cmdq_switch:
+	err = mmc_blk_cmdq_switch(card, md, true);
+	if (err) {
+		pr_err("%s: %s: mmc_blk_cmdq_switch failed: %d\n",
+			mmc_hostname(host), __func__,  err);
+		ret = err;
+		goto out;
+	}
+cmdq_unhalt:
+	err = mmc_cmdq_halt(host, false);
+	if (err) {
+		pr_err("%s: %s: unhalt: failed: %d\n",
+			mmc_hostname(host), __func__,  err);
+		ret = err;
+	}
+out:
+	return ret;
 }
 
 static int mmc_blk_cmdq_issue_rq(struct mmc_queue *mq, struct request *req)
 {
-	int ret;
+	int ret, err = 0;
 	struct mmc_blk_data *md = mq->data;
 	struct mmc_card *card = md->queue.card;
+	struct mmc_host *host = card->host;
 	unsigned int cmd_flags = req ? req->cmd_flags : 0;
 
 	mmc_get_card(card);
@@ -3977,9 +4062,20 @@ static int mmc_blk_cmdq_issue_rq(struct mmc_queue *mq, struct request *req)
 
 	ret = mmc_blk_cmdq_part_switch(card, md);
 	if (ret) {
-		pr_err("%s: %s: partition switch failed %d\n",
+		pr_err("%s: %s: partition switch failed %d, resetting cmdq\n",
 				md->disk->disk_name, __func__, ret);
-		goto out;
+
+		mmc_blk_cmdq_reset(host, false);
+		err = mmc_blk_cmdq_part_switch(card, md);
+		if (!err) {
+			pr_err("%s: %s: partition switch success err = %d\n",
+				md->disk->disk_name, __func__, err);
+		} else {
+			pr_err("%s: %s: partition switch failed err = %d\n",
+				md->disk->disk_name, __func__, err);
+			ret = err;
+			goto out;
+		}
 	}
 
 	if (req) {
@@ -4023,9 +4119,16 @@ static int mmc_blk_cmdq_issue_rq(struct mmc_queue *mq, struct request *req)
 			 * If issuing of the request fails with eitehr EBUSY or
 			 * EAGAIN error, re-queue the request.
 			 * This case would occur with ICE calls.
+			 * For request which gets completed successfully or
+			 * errored out, we release host lock in completion or
+			 * error handling softirq context. But here the request
+			 * is neither completed nor erred-out, so release the
+			 * host lock explicitly.
 			 */
-			if (ret == -EBUSY || ret == -EAGAIN)
+			if (ret == -EBUSY || ret == -EAGAIN) {
 				mmc_blk_cmdq_requeue_rw_rq(mq, req);
+				mmc_put_card(host->card);
+			}
 		}
 	}
 
@@ -4625,6 +4728,11 @@ static int mmc_blk_probe(struct mmc_card *card)
 {
 	struct mmc_blk_data *md, *part_md;
 	char cap_str[10];
+	/* FIH, add for emmcinfo { */
+        char buf[FIH_EMMC_SIZE];
+        unsigned int max_count = 0;
+        unsigned int sec_count = 0;
+        /* FIH, add for emmcinfo } */
 
 	/*
 	 * Check that the card supports the command class(es) we need.
@@ -4644,14 +4752,61 @@ static int mmc_blk_probe(struct mmc_card *card)
 		md->disk->disk_name, mmc_card_id(card), mmc_card_name(card),
 		cap_str, md->read_only ? "(ro)" : "");
 
+	if(strncmp(md->disk->disk_name, "mmcblk1", 7) == 0) {
+		printk("BBox::UPD;68::%llu::%u::%s\n", (u64)get_capacity(md->disk)*(u64)512, mmc_card_manfid(card), mmc_card_name(card));
+	}
+	/* FIH, add for emmcinfo { */
+        if (0 == strcmp("mmcblk0", md->disk->disk_name))
+        {
+                switch (card->cid.manfid) {
+                        case 0x02: sprintf(buf, "Sandisk"); break;
+                        case 0x11: sprintf(buf, "Toshiba"); break;
+                        case 0x15: sprintf(buf, "Samsung"); break;
+                        case 0x45: sprintf(buf, "Sandisk"); break;
+                        case 0x70: sprintf(buf, "Kingston"); break;
+                        case 0x90: sprintf(buf, "Hynix"); break;
+                        case 0x13: sprintf(buf, "Micron"); break;
+                        default:   sprintf(buf, "Unknown"); break;
+                }
+
+                switch (card->ext_csd.rev) {
+                        case 0x00: strcat(buf, " 4.0"); break;
+                        case 0x01: strcat(buf, " 4.1"); break;
+                        case 0x02: strcat(buf, " 4.2"); break;
+                        case 0x03: strcat(buf, " 4.3"); break;
+                        case 0x04: strcat(buf, " 4.4"); break;
+                        case 0x05: strcat(buf, " 4.41"); break;
+                        case 0x06: strcat(buf, " 4.5"); break;
+                        case 0x07: sprintf(buf, "%s 5.0", buf);  break;
+                        case 0x08: sprintf(buf, "%s 5.1", buf);  break;
+                        default: sprintf(buf, "%s 0x%x", buf, card->ext_csd.rev);break;
+                }
+
+                sec_count =
+                  + ((card->ext_csd.raw_sectors[3]) << 24)
+                  + ((card->ext_csd.raw_sectors[2]) << 16)
+                  + ((card->ext_csd.raw_sectors[1]) <<  8)
+                  + (card->ext_csd.raw_sectors[0]);
+
+                max_count = 1 << 21; /* 1GB */
+                while (max_count < sec_count) {
+                        max_count = max_count << 1;
+                }
+                sprintf(buf, "%s %dG", buf, (max_count >> 21));
+
+                sprintf(buf, "%s 0x%x", buf, card->cid.prv);
+
+                fih_emmc_setup(buf);
+                printk("BBox::UPD;102::%08x%08x%08x%08x\n", card->raw_cid[0], card->raw_cid[1],card->raw_cid[2], card->raw_cid[3]);
+        }
+        /* FIH, add for emmcinfo } */
+
 	if (mmc_blk_alloc_parts(card, md))
 		goto out;
 
 	dev_set_drvdata(&card->dev, md);
 
-#ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
 	mmc_set_bus_resume_policy(card->host, 1);
-#endif
 
 	if (mmc_add_disk(md))
 		goto out;
@@ -4696,9 +4851,7 @@ static void mmc_blk_remove(struct mmc_card *card)
 	pm_runtime_put_noidle(&card->dev);
 	mmc_blk_remove_req(md);
 	dev_set_drvdata(&card->dev, NULL);
-#ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
 	mmc_set_bus_resume_policy(card->host, 0);
-#endif
 }
 
 static int _mmc_blk_suspend(struct mmc_card *card, bool wait)
