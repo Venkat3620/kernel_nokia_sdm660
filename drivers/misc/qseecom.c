@@ -1,6 +1,6 @@
 /*Qualcomm Secure Execution Environment Communicator (QSEECOM) driver
  *
- * Copyright (c) 2012-2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -1729,7 +1729,7 @@ static int __qseecom_process_incomplete_cmd(struct qseecom_dev_handle *data,
 		if (ptr_svc->svc.listener_id != lstnr) {
 			pr_warn("Service requested does not exist\n");
 			__qseecom_qseos_fail_return_resp_tz(data, resp,
-					&send_data_rsp, ptr_svc, lstnr);
+					&send_data_rsp, NULL, lstnr);
 			return -ERESTARTSYS;
 		}
 		pr_debug("waking up rcv_req_wq and waiting for send_resp_wq\n");
@@ -2533,8 +2533,7 @@ static int qseecom_unmap_ion_allocated_memory(struct qseecom_dev_handle *data)
 	if (!IS_ERR_OR_NULL(data->client.ihandle)) {
 		ion_unmap_kernel(qseecom.ion_clnt, data->client.ihandle);
 		ion_free(qseecom.ion_clnt, data->client.ihandle);
-		memset((void *)&data->client,
-			0, sizeof(struct qseecom_client_handle));
+		data->client.ihandle = NULL;
 	}
 	return ret;
 }
@@ -4747,8 +4746,12 @@ int qseecom_process_listener_from_smcinvoke(struct scm_desc *desc)
 	dummy_app_entry.app_id = desc->ret[1];
 
 	mutex_lock(&app_access_lock);
-	ret = __qseecom_process_reentrancy(&resp, &dummy_app_entry,
+	if (qseecom.qsee_reentrancy_support)
+		ret = __qseecom_process_reentrancy(&resp, &dummy_app_entry,
 					&dummy_private_data);
+	else
+		ret = __qseecom_process_incomplete_cmd(&dummy_private_data,
+					&resp);
 	mutex_unlock(&app_access_lock);
 	if (ret)
 		pr_err("Failed on cmd %d for lsnr %d session %d, ret = %d\n",
@@ -6419,9 +6422,11 @@ static int __qseecom_update_qteec_req_buf(struct qseecom_qteec_modfd_req *req,
 				pr_err("Ion client can't retrieve the handle\n");
 				return -ENOMEM;
 			}
-			if ((req->req_len < sizeof(uint32_t)) ||
+			if ((req->req_len <
+				sizeof(struct qseecom_param_memref)) ||
 				(req->ifd_data[i].cmd_buf_offset >
-				req->req_len - sizeof(uint32_t))) {
+				req->req_len -
+				sizeof(struct qseecom_param_memref))) {
 				pr_err("Invalid offset/req len 0x%x/0x%x\n",
 					req->req_len,
 					req->ifd_data[i].cmd_buf_offset);
@@ -7278,6 +7283,13 @@ long qseecom_ioctl(struct file *file, unsigned cmd, unsigned long arg)
 		break;
 	}
 	case QSEECOM_IOCTL_APP_LOADED_QUERY_REQ: {
+		if ((data->type != QSEECOM_GENERIC) &&
+			(data->type != QSEECOM_CLIENT_APP)) {
+			pr_err("app loaded query req: invalid handle (%d)\n",
+								data->type);
+			ret = -EINVAL;
+			break;
+		}
 		data->type = QSEECOM_CLIENT_APP;
 		mutex_lock(&app_access_lock);
 		atomic_inc(&data->ioctl_count);
