@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2016-2017, 2019 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -11,6 +11,20 @@
  */
 
 #include "msm8996v3-auto.dtsi"
+
+/ {
+	firmware: firmware {
+		android {
+			fstab {
+				/delete-node/ system;
+				vendor {
+					fsmgr_flags = "wait,slotselect,avb";
+					status = "ok";
+				};
+			};
+		};
+	};
+};
 
 &gfx_vreg {
 	qcom,cpr-fuse-combos = <24>;
@@ -466,5 +480,11 @@
 		qcom,gpu-pwrlevels-0 {
 			qcom,initial-pwrlevel = <1>;
 		};
+
+		qcom,gpu-pwrlevels-2 {
+			qcom,initial-pwrlevel = <2>;
+
+		};
+
 	};
 };

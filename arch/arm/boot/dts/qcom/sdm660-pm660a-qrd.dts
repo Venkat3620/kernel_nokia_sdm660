@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2016-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -21,7 +21,9 @@
 	model = "Qualcomm Technologies, Inc. SDM 660 PM660 + PM660A QRD";
 	compatible = "qcom,sdm660-qrd", "qcom,sdm660", "qcom,qrd";
 	qcom,board-id = <0x0012000b 0>;
-	qcom,pmic-id = <0x0001001b 0x0001011a 0x0 0x0>;
+	qcom,pmic-id = <0x0001001b 0x0001011a 0x0 0x0>,
+			<0x0001001b 0x0002001a 0x0 0x0>,
+			<0x0001001b 0x0202001a 0x0 0x0>;
 };
 
 &pm660a_oledb {
@@ -31,15 +33,6 @@
 
 &mdss_mdp {
 	qcom,mdss-pref-prim-intf = "dsi";
-};
-
-&mdss_dp_ctrl {
-	pinctrl-names = "mdss_dp_active", "mdss_dp_sleep";
-	pinctrl-0 = <&mdss_dp_aux_active &mdss_dp_usbplug_cc_active>;
-	pinctrl-1 = <&mdss_dp_aux_suspend &mdss_dp_usbplug_cc_suspend>;
-	qcom,aux-en-gpio = <&tlmm 55 0>;
-	qcom,aux-sel-gpio = <&tlmm 56 0>;
-	qcom,usbplug-cc-gpio = <&tlmm 58 0>;
 };
 
 &mdss_dsi {
