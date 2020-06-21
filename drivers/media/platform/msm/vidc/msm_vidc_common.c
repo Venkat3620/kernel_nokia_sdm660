@@ -1210,6 +1210,20 @@ static void handle_event_change(enum hal_command_response cmd, void *data)
 		break;
 	}
 
+	/*
+	 * Force output to linear format if it's interlaced UBWC format
+	 * to support interlaced clips playback
+	 */
+	if ((inst->allow_ubwc_linear_event) &&
+		(event_notify->pic_struct ==
+			MSM_VIDC_PIC_STRUCT_MAYBE_INTERLACED)) {
+		u32 fmt_fourcc = inst->fmts[CAPTURE_PORT].fourcc;
+
+		if ((fmt_fourcc == V4L2_PIX_FMT_NV12_TP10_UBWC) ||
+			(fmt_fourcc == V4L2_PIX_FMT_NV12_UBWC))
+			inst->fmts[CAPTURE_PORT].fourcc = V4L2_PIX_FMT_NV12;
+	}
+
 	/* Bit depth and pic struct changed event are combined into a single
 	 * event (insufficient event) for the userspace. Currently bitdepth
 	 * changes is only for HEVC and interlaced support is for all
@@ -2061,6 +2075,7 @@ static void handle_fbd(enum hal_command_response cmd, void *data)
 	int extra_idx = 0;
 	int64_t time_usec = 0;
 	struct vb2_v4l2_buffer *vbuf = NULL;
+	struct buffer_info *buffer_info = NULL;
 
 	if (!response) {
 		dprintk(VIDC_ERR, "Invalid response from vidc_hal\n");
@@ -2102,6 +2117,26 @@ static void handle_fbd(enum hal_command_response cmd, void *data)
 				"fbd:Overflow bytesused = %d; length = %d\n",
 				vb->planes[0].bytesused,
 				vb->planes[0].length);
+
+		buffer_info = device_to_uvaddr(&inst->registeredbufs,
+			fill_buf_done->packet_buffer1);
+
+		if (!buffer_info) {
+			dprintk(VIDC_ERR,
+				"%s buffer not found in registered list\n",
+				__func__);
+			return;
+		}
+
+		buffer_info->crop_data.nLeft = fill_buf_done->start_x_coord;
+		buffer_info->crop_data.nTop = fill_buf_done->start_y_coord;
+		buffer_info->crop_data.nWidth = fill_buf_done->frame_width;
+		buffer_info->crop_data.nHeight = fill_buf_done->frame_height;
+		buffer_info->crop_data.width_height[0] =
+						inst->prop.width[CAPTURE_PORT];
+		buffer_info->crop_data.width_height[1] =
+						inst->prop.height[CAPTURE_PORT];
+
 		if (!(fill_buf_done->flags1 &
 			HAL_BUFFERFLAG_TIMESTAMPINVALID)) {
 			time_usec = fill_buf_done->timestamp_hi;
@@ -2614,6 +2649,7 @@ int msm_comm_check_core_init(struct msm_vidc_core *core)
 	int rc = 0;
 	struct hfi_device *hdev;
 	struct msm_vidc_inst *inst = NULL;
+	int dref = 0;
 
 	mutex_lock(&core->lock);
 	if (core->state >= VIDC_CORE_INIT_DONE) {
@@ -2637,11 +2673,16 @@ int msm_comm_check_core_init(struct msm_vidc_core *core)
 		 * Just grab one of the inst from instances list and
 		 * use it.
 		 */
-		inst = list_first_entry(&core->instances,
+		inst = list_first_entry_or_null(&core->instances,
 			struct msm_vidc_inst, list);
+		if (inst)
+			dref = kref_get_unless_zero(&inst->kref);
 
 		mutex_unlock(&core->lock);
-		msm_comm_print_debug_info(inst);
+		if (dref) {
+			msm_comm_print_debug_info(inst);
+			put_inst(inst);
+		}
 		mutex_lock(&core->lock);
 
 		BUG_ON(msm_vidc_debug_timeout);

@@ -22,6 +22,7 @@
 #include "cam_hw_ops.h"
 #include "msm_isp47.h"
 #include "cam_soc_api.h"
+#include "msm_camera_diag_util.h"
 
 #undef CDBG
 #define CDBG(fmt, args...) pr_debug(fmt, ##args)
@@ -306,19 +307,12 @@ int msm_vfe47_init_hardware(struct vfe_device *vfe_dev)
 	vfe_dev->common_data->dual_vfe_res->vfe_base[vfe_dev->pdev->id] =
 		vfe_dev->vfe_base;
 
-	rc = msm_isp_update_bandwidth(ISP_VFE0 + vfe_dev->pdev->id,
-					MSM_ISP_MIN_AB, MSM_ISP_MIN_IB);
-	if (rc)
-		goto bw_enable_fail;
-
 	rc = msm_camera_enable_irq(vfe_dev->vfe_irq, 1);
 	if (rc < 0)
 		goto irq_enable_fail;
 
 	return rc;
 irq_enable_fail:
-	msm_isp_update_bandwidth(ISP_VFE0 + vfe_dev->pdev->id, 0, 0);
-bw_enable_fail:
 	vfe_dev->common_data->dual_vfe_res->vfe_base[vfe_dev->pdev->id] = NULL;
 	if (cam_config_ahb_clk(NULL, 0, id, CAM_AHB_SUSPEND_VOTE) < 0)
 		pr_err("%s: failed to remove vote for AHB\n", __func__);
@@ -346,8 +340,6 @@ void msm_vfe47_release_hardware(struct vfe_device *vfe_dev)
 	msm_isp_flush_tasklet(vfe_dev);
 
 	vfe_dev->common_data->dual_vfe_res->vfe_base[vfe_dev->pdev->id] = NULL;
-
-	msm_isp_update_bandwidth(ISP_VFE0 + vfe_dev->pdev->id, 0, 0);
 
 	if (vfe_dev->pdev->id == 0)
 		id = CAM_AHB_CLIENT_VFE0;
@@ -602,7 +594,6 @@ void msm_vfe47_process_reg_update(struct vfe_device *vfe_dev,
 			case VFE_RAW_1:
 			case VFE_RAW_2:
 				msm_isp_increment_frame_id(vfe_dev, i, ts);
-				msm_isp_notify(vfe_dev, ISP_EVENT_SOF, i, ts);
 				msm_isp_update_framedrop_reg(vfe_dev, i);
 				/*
 				 * Reg Update is pseudo SOF for RDI,
@@ -650,7 +641,6 @@ void msm_vfe47_process_epoch_irq(struct vfe_device *vfe_dev,
 		msm_isp_update_framedrop_reg(vfe_dev, VFE_PIX_0);
 		msm_isp_update_stats_framedrop_reg(vfe_dev);
 		msm_isp_update_error_frame_count(vfe_dev);
-		msm_isp_notify(vfe_dev, ISP_EVENT_SOF, VFE_PIX_0, ts);
 		if (vfe_dev->axi_data.src_info[VFE_PIX_0].raw_stream_count > 0
 			&& vfe_dev->axi_data.src_info[VFE_PIX_0].
 			pix_stream_count == 0) {
@@ -660,6 +650,23 @@ void msm_vfe47_process_epoch_irq(struct vfe_device *vfe_dev,
 				vfe_dev, VFE_PIX_0);
 		}
 	}
+}
+
+void msm_isp47_process_sof_irq(struct vfe_device *vfe_dev,
+	uint32_t irq_status0, uint32_t irq_status1,
+	struct msm_isp_timestamp *ts)
+{
+	if ((!(irq_status0 & 0x1)) && (!(irq_status1 & 0xE0000000)))
+		return;
+
+	if (irq_status0 & BIT(0))
+		msm_isp_notify(vfe_dev, ISP_EVENT_SOF, VFE_PIX_0, ts);
+	if (irq_status1 & BIT(29))
+		msm_isp_notify(vfe_dev, ISP_EVENT_SOF, VFE_RAW_0, ts);
+	if (irq_status1 & BIT(30))
+		msm_isp_notify(vfe_dev, ISP_EVENT_SOF, VFE_RAW_1, ts);
+	if (irq_status1 & BIT(31))
+		msm_isp_notify(vfe_dev, ISP_EVENT_SOF, VFE_RAW_2, ts);
 }
 
 void msm_isp47_process_eof_irq(struct vfe_device *vfe_dev,
@@ -2390,6 +2397,8 @@ int msm_vfe47_update_bandwidth(
 		ab, ib,
 		isp_bandwidth_mgr->client_info,
 		sched_clock());
+	msm_camera_diag_update_isp_state(
+		isp_bandwidth_mgr->bus_vector_active_idx, ab, ib);
 	return 0;
 }
 
@@ -2420,9 +2429,30 @@ void msm_vfe47_put_clks(struct vfe_device *vfe_dev)
 
 int msm_vfe47_enable_clks(struct vfe_device *vfe_dev, int enable)
 {
-	return msm_camera_clk_enable(&vfe_dev->pdev->dev,
+	unsigned long flags;
+	int rc;
+
+	if (!enable) {
+		spin_lock_irqsave(&vfe_dev->tasklet_lock, flags);
+		vfe_dev->clk_enabled = false;
+		spin_unlock_irqrestore(&vfe_dev->tasklet_lock, flags);
+	}
+
+	rc = msm_camera_clk_enable(&vfe_dev->pdev->dev,
 			vfe_dev->vfe_clk_info,
 			vfe_dev->vfe_clk, vfe_dev->num_clk, enable);
+	if (rc < 0) {
+		pr_err("%s: clk set %d failed %d\n", __func__, enable, rc);
+		return rc;
+	}
+
+	if (enable) {
+		spin_lock_irqsave(&vfe_dev->tasklet_lock, flags);
+		vfe_dev->clk_enabled = true;
+		spin_unlock_irqrestore(&vfe_dev->tasklet_lock, flags);
+	}
+
+	return rc;
 }
 
 int msm_vfe47_set_clk_rate(struct vfe_device *vfe_dev, long *rate)
@@ -2723,6 +2753,7 @@ struct msm_vfe_hardware_info vfe47_hw_info = {
 			.process_stats_irq = msm_isp_process_stats_irq,
 			.process_epoch_irq = msm_vfe47_process_epoch_irq,
 			.config_irq = msm_vfe47_config_irq,
+			.process_sof_irq = msm_isp47_process_sof_irq,
 			.process_eof_irq = msm_isp47_process_eof_irq,
 		},
 		.axi_ops = {

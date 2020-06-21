@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -37,6 +37,7 @@ static struct list_head    ordered_sd_list;
 static struct mutex        ordered_sd_mtx;
 static struct mutex        v4l2_event_mtx;
 
+static atomic_t qos_add_request_done = ATOMIC_INIT(0);
 static struct pm_qos_request msm_v4l2_pm_qos_request;
 
 static struct msm_queue_head *msm_session_q;
@@ -218,9 +219,11 @@ static inline int __msm_queue_find_command_ack_q(void *d1, void *d2)
 	return (ack->stream_id == *(unsigned int *)d2) ? 1 : 0;
 }
 
-static void msm_pm_qos_add_request(void)
+static inline void msm_pm_qos_add_request(void)
 {
 	pr_info("%s: add request", __func__);
+	if (atomic_cmpxchg(&qos_add_request_done, 0, 1))
+		return;
 	pm_qos_add_request(&msm_v4l2_pm_qos_request, PM_QOS_CPU_DMA_LATENCY,
 	PM_QOS_DEFAULT_VALUE);
 }
@@ -234,6 +237,7 @@ static void msm_pm_qos_remove_request(void)
 void msm_pm_qos_update_request(int val)
 {
 	pr_info("%s: update request %d", __func__, val);
+	msm_pm_qos_add_request();
 	pm_qos_update_request(&msm_v4l2_pm_qos_request, val);
 }
 
@@ -1308,7 +1312,10 @@ static const struct file_operations logsync_fops = {
 static int msm_probe(struct platform_device *pdev)
 {
 	struct msm_video_device *pvdev = NULL;
+#if 0//QC 03210652: just create a file and not writing anything. to disable it ++
+//junit.framework.AssertionFailedError: Found writable: [/sys/kernel/debug/camera/logsync]
 	static struct dentry *cam_debugfs_root;
+#endif //QC 03210652 --
 	int rc = 0;
 
 	msm_v4l2_dev = kzalloc(sizeof(*msm_v4l2_dev),
@@ -1392,6 +1399,8 @@ static int msm_probe(struct platform_device *pdev)
 	mutex_init(&v4l2_event_mtx);
 	INIT_LIST_HEAD(&ordered_sd_list);
 
+#if 0//QC 03210652: just create a file and not writing anything. to disable it ++
+//junit.framework.AssertionFailedError: Found writable: [/sys/kernel/debug/camera/logsync]
 	cam_debugfs_root = debugfs_create_dir(MSM_CAM_LOGSYNC_FILE_BASEDIR,
 						NULL);
 	if (!cam_debugfs_root) {
@@ -1404,7 +1413,7 @@ static int msm_probe(struct platform_device *pdev)
 					 &logsync_fops))
 			pr_warn("NON-FATAL: failed to create logsync debugfs file\n");
 	}
-
+#endif //QC 03210652 --
 	rc = cam_ahb_clk_init(pdev);
 	if (rc < 0) {
 		pr_err("%s: failed to register ahb clocks\n", __func__);

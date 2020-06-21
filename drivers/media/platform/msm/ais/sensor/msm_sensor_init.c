@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -16,11 +16,14 @@
 #include "msm_sensor_driver.h"
 #include "msm_sensor.h"
 #include "msm_sd.h"
+#include "msm_camera_io_util.h"
+#include "msm_early_cam.h"
 
 /* Logging macro */
 #undef CDBG
 #define CDBG(fmt, args...) pr_debug(fmt, ##args)
 
+static bool early_camera_clock_off;
 static struct msm_sensor_init_t *s_init;
 
 static int msm_sensor_wait_for_probe_done(struct msm_sensor_init_t *s_init)
@@ -54,6 +57,8 @@ int32_t msm_sensor_driver_cmd(struct msm_sensor_init_t *s_init, void *arg)
 		return -EINVAL;
 	}
 
+	/* Postpone hardware changes until early camera is complete */
+	msm_early_camera_wait();
 	pr_debug("%s : %d", __func__, cfg->cfgtype);
 	switch (cfg->cfgtype) {
 	case CFG_SINIT_PROBE:
@@ -68,6 +73,18 @@ int32_t msm_sensor_driver_cmd(struct msm_sensor_init_t *s_init, void *arg)
 		break;
 
 	case CFG_SINIT_PROBE_DONE:
+		if (early_camera_clock_off == false) {
+			msm_early_camera_wait();
+			rc = msm_early_cam_disable_clocks();
+			if (rc < 0) {
+				pr_err("Failed to disable early camera :%d\n",
+					rc);
+			} else {
+				early_camera_clock_off = true;
+				pr_debug("Voted OFF early camera clocks\n");
+			}
+		}
+
 		s_init->module_init_status = 1;
 		wake_up(&s_init->state_wait);
 		break;
@@ -99,6 +116,7 @@ static int __init msm_sensor_init_module(void)
 	mutex_init(&s_init->imutex);
 
 	init_waitqueue_head(&s_init->state_wait);
+	early_camera_clock_off = false;
 	return ret;
 }
 
