@@ -902,6 +902,10 @@ static int vfio_pci_mmap(void *device_data, struct vm_area_struct *vma)
 			return ret;
 
 		vdev->barmap[index] = pci_iomap(pdev, index, 0);
+		if (!vdev->barmap[index]) {
+			pci_release_selected_regions(pdev, 1 << index);
+			return -ENOMEM;
+		}
 	}
 
 	vma->vm_private_data = vdev;
@@ -1187,11 +1191,11 @@ static void __init vfio_pci_fill_ids(void)
 		rc = pci_add_dynid(&vfio_pci_driver, vendor, device,
 				   subvendor, subdevice, class, class_mask, 0);
 		if (rc)
-			pr_warn("failed to add dynamic id [%04hx:%04hx[%04hx:%04hx]] class %#08x/%08x (%d)\n",
+			pr_warn("failed to add dynamic id [%04x:%04x[%04x:%04x]] class %#08x/%08x (%d)\n",
 				vendor, device, subvendor, subdevice,
 				class, class_mask, rc);
 		else
-			pr_info("add [%04hx:%04hx[%04hx:%04hx]] class %#08x/%08x\n",
+			pr_info("add [%04x:%04x[%04x:%04x]] class %#08x/%08x\n",
 				vendor, device, subvendor, subdevice,
 				class, class_mask);
 	}

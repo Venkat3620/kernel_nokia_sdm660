@@ -796,7 +796,7 @@ inc_loop:
 			list_del(&mport->list);
 			kfree(mport);
 		}
-		if (!mport_next || (&mport_next->list == &swrm->mport_list)) {
+		if (!mport_next) {
 			dev_err(swrm->dev, "%s: end of list\n", __func__);
 			break;
 		}

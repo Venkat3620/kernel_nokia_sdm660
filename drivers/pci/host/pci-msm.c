@@ -6812,7 +6812,7 @@ static int msm_pcie_pm_suspend(struct pci_dev *dev,
 	return ret;
 }
 
-static void msm_pcie_fixup_suspend(struct pci_dev *dev)
+static void msm_pcie_fixup_suspend_late(struct pci_dev *dev)
 {
 	int ret;
 	struct msm_pcie_dev_t *pcie_dev = PCIE_BUS_PRIV_DATA(dev->bus);
@@ -6844,8 +6844,8 @@ static void msm_pcie_fixup_suspend(struct pci_dev *dev)
 
 	mutex_unlock(&pcie_dev->recovery_lock);
 }
-DECLARE_PCI_FIXUP_SUSPEND(PCIE_VENDOR_ID_RCP, PCIE_DEVICE_ID_RCP,
-			  msm_pcie_fixup_suspend);
+DECLARE_PCI_FIXUP_SUSPEND_LATE(PCIE_VENDOR_ID_RCP, PCIE_DEVICE_ID_RCP,
+			  msm_pcie_fixup_suspend_late);
 
 /* Resume the PCIe link */
 static int msm_pcie_pm_resume(struct pci_dev *dev,
@@ -6879,17 +6879,24 @@ static int msm_pcie_pm_resume(struct pci_dev *dev,
 			 dev->bus->number, dev->bus->primary);
 
 		if (!(options & MSM_PCIE_CONFIG_NO_CFG_RESTORE)) {
-			PCIE_DBG(pcie_dev,
-				"RC%d: entry of PCI framework restore state\n",
-				pcie_dev->rc_idx);
+			if (pcie_dev->saved_state) {
+				PCIE_DBG(pcie_dev,
+					 "RC%d: entry of PCI framework restore state\n",
+					 pcie_dev->rc_idx);
 
-			pci_load_and_free_saved_state(dev,
-					&pcie_dev->saved_state);
-			pci_restore_state(dev);
+				pci_load_and_free_saved_state(dev,
+						      &pcie_dev->saved_state);
+				pci_restore_state(dev);
 
-			PCIE_DBG(pcie_dev,
-				"RC%d: exit of PCI framework restore state\n",
-				pcie_dev->rc_idx);
+				PCIE_DBG(pcie_dev,
+					 "RC%d: exit of PCI framework restore state\n",
+					 pcie_dev->rc_idx);
+			} else {
+				PCIE_DBG(pcie_dev,
+					 "RC%d: restore rc config space using shadow recovery\n",
+					 pcie_dev->rc_idx);
+				msm_pcie_cfg_recover(pcie_dev, true);
+			}
 		}
 	}
 

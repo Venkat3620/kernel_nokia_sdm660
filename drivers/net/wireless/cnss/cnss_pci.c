@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -569,6 +569,7 @@ out:
 
 static void cnss_wlan_gpio_set(struct cnss_wlan_gpio_info *info, bool state)
 {
+#ifndef CONFIG_MSM_GVM_QUIN
 	if (!info->prop)
 		return;
 
@@ -588,6 +589,9 @@ static void cnss_wlan_gpio_set(struct cnss_wlan_gpio_info *info, bool state)
 
 	pr_debug("%s: %s gpio is now %s\n", __func__,
 		 info->name, info->state ? "enabled" : "disabled");
+#else
+	return;
+#endif
 }
 
 static int cnss_configure_wlan_en_gpio(bool state)
@@ -1477,8 +1481,8 @@ static int cnss_smmu_init(struct device *dev)
 					   penv->smmu_iova_start,
 					   penv->smmu_iova_len);
 	if (IS_ERR(mapping)) {
-		pr_err("%s: create mapping failed, err = %d\n", __func__, ret);
 		ret = PTR_ERR(mapping);
+		pr_err("%s: create mapping failed, err = %d\n", __func__, ret);
 		goto map_fail;
 	}
 
@@ -1529,6 +1533,21 @@ int cnss_msm_pcie_pm_control(
 	return msm_pcie_pm_control(pm_opt, bus_num, pdev, NULL, options);
 }
 
+#ifndef CONFIG_GHS_VMM
+static int cnss_msm_pcie_suspend_resume(
+		enum msm_pcie_pm_opt pm_opt, u32 bus_num,
+		struct pci_dev *pdev, u32 options)
+{
+	return msm_pcie_pm_control(pm_opt, bus_num, pdev, NULL, options);
+}
+#else
+static inline int cnss_msm_pcie_suspend_resume(
+		enum msm_pcie_pm_opt pm_opt, u32 bus_num,
+		struct pci_dev *pdev, u32 options)
+{
+	return 0;
+}
+#endif
 int cnss_pci_load_and_free_saved_state(
 	struct pci_dev *dev, struct pci_saved_state **state)
 {
@@ -1560,7 +1579,6 @@ int cnss_msm_pcie_enumerate(u32 rc_idx)
 	return msm_pcie_enumerate(rc_idx);
 }
 #else /* !defined CONFIG_PCI_MSM */
-
 struct pci_saved_state *cnss_pci_store_saved_state(struct pci_dev *dev)
 {
 	return NULL;
@@ -1570,7 +1588,7 @@ int cnss_msm_pcie_pm_control(
 		enum msm_pcie_pm_opt pm_opt, u32 bus_num,
 		struct pci_dev *pdev, u32 options)
 {
-	return -ENODEV;
+	return 0;
 }
 
 int cnss_pci_load_and_free_saved_state(
@@ -1581,27 +1599,27 @@ int cnss_pci_load_and_free_saved_state(
 
 int cnss_msm_pcie_shadow_control(struct pci_dev *dev, bool enable)
 {
-	return -ENODEV;
+	return 0;
 }
 
 int cnss_msm_pcie_deregister_event(struct msm_pcie_register_event *reg)
 {
-	return -ENODEV;
+	return 0;
 }
 
 int cnss_msm_pcie_recover_config(struct pci_dev *dev)
 {
-	return -ENODEV;
+	return 0;
 }
 
 int cnss_msm_pcie_register_event(struct msm_pcie_register_event *reg)
 {
-	return -ENODEV;
+	return 0;
 }
 
 int cnss_msm_pcie_enumerate(u32 rc_idx)
 {
-	return -EPROBE_DEFER;
+	return 0;
 }
 #endif
 
@@ -1658,7 +1676,7 @@ static int cnss_wlan_pci_probe(struct pci_dev *pdev,
 		pci_save_state(pdev);
 		penv->saved_state = cnss_pci_store_saved_state(pdev);
 
-		ret = cnss_msm_pcie_pm_control(
+		ret = cnss_msm_pcie_suspend_resume(
 			MSM_PCIE_SUSPEND, cnss_get_pci_dev_bus_number(pdev),
 			pdev, PM_OPTIONS);
 		if (ret) {
@@ -1975,7 +1993,7 @@ static inline void __cnss_disable_irq(void *data)
 {
 	struct pci_dev *pdev = data;
 
-	disable_irq(pdev->irq);
+	disable_irq_nosync(pdev->irq);
 }
 
 void cnss_pci_events_cb(struct msm_pcie_notify *notify)
@@ -2343,7 +2361,7 @@ again:
 		pr_err("%s: PCIe event register failed! %d\n", __func__, ret);
 
 	if (!penv->pcie_link_state && !penv->pcie_link_down_ind) {
-		ret = cnss_msm_pcie_pm_control(
+		ret = cnss_msm_pcie_suspend_resume(
 			MSM_PCIE_RESUME, cnss_get_pci_dev_bus_number(pdev),
 			pdev, PM_OPTIONS);
 		if (ret) {
@@ -2352,11 +2370,9 @@ again:
 		}
 		penv->pcie_link_state = PCIE_LINK_UP;
 	} else if (!penv->pcie_link_state && penv->pcie_link_down_ind) {
-
-		ret = cnss_msm_pcie_pm_control(
+		ret = cnss_msm_pcie_suspend_resume(
 			MSM_PCIE_RESUME, cnss_get_pci_dev_bus_number(pdev),
 			pdev, PM_OPTIONS_RESUME_LINK_DOWN);
-
 		if (ret) {
 			pr_err("PCIe link bring-up failed (link down option)\n");
 			goto err_pcie_link_up;
@@ -2393,7 +2409,7 @@ again:
 			pci_save_state(pdev);
 			penv->saved_state = cnss_pci_store_saved_state(pdev);
 			cnss_msm_pcie_deregister_event(&penv->event_reg);
-			cnss_msm_pcie_pm_control(
+			cnss_msm_pcie_suspend_resume(
 				MSM_PCIE_SUSPEND,
 				cnss_get_pci_dev_bus_number(pdev),
 				pdev, PM_OPTIONS);
@@ -2418,7 +2434,7 @@ err_wlan_probe:
 err_pcie_link_up:
 	cnss_msm_pcie_deregister_event(&penv->event_reg);
 	if (penv->pcie_link_state) {
-		cnss_msm_pcie_pm_control(
+		cnss_msm_pcie_suspend_resume(
 			MSM_PCIE_SUSPEND, cnss_get_pci_dev_bus_number(pdev),
 			pdev, PM_OPTIONS);
 		penv->pcie_link_state = PCIE_LINK_DOWN;
@@ -2481,8 +2497,7 @@ void cnss_wlan_unregister_driver(struct cnss_wlan_driver *driver)
 	if (penv->pcie_link_state && !penv->pcie_link_down_ind) {
 		pci_save_state(pdev);
 		penv->saved_state = cnss_pci_store_saved_state(pdev);
-
-		if (cnss_msm_pcie_pm_control(
+		if (cnss_msm_pcie_suspend_resume(
 			MSM_PCIE_SUSPEND, cnss_get_pci_dev_bus_number(pdev),
 			pdev, PM_OPTIONS)) {
 			pr_err("Failed to shutdown PCIe link\n");
@@ -2490,8 +2505,7 @@ void cnss_wlan_unregister_driver(struct cnss_wlan_driver *driver)
 		}
 	} else if (penv->pcie_link_state && penv->pcie_link_down_ind) {
 		penv->saved_state = NULL;
-
-		if (cnss_msm_pcie_pm_control(
+		if (cnss_msm_pcie_suspend_resume(
 			MSM_PCIE_SUSPEND, cnss_get_pci_dev_bus_number(pdev),
 				pdev, PM_OPTIONS_SUSPEND_LINK_DOWN)) {
 			pr_err("Failed to shutdown PCIe link (with linkdown option)\n");
@@ -2714,10 +2728,14 @@ err_pcie_link_up:
 	cnss_configure_wlan_en_gpio(WLAN_EN_LOW);
 	cnss_wlan_vreg_set(vreg_info, VREG_OFF);
 	if (penv->pdev) {
-		pr_err("%d: Unregistering pci device\n", __LINE__);
-		pci_unregister_driver(&cnss_wlan_pci_driver);
-		penv->pdev = NULL;
-		penv->pci_register_again = true;
+		if (wdrv && wdrv->update_status)
+			wdrv->update_status(penv->pdev, CNSS_SSR_FAIL);
+		if (!penv->recovery_in_progress) {
+			pr_err("%d: Unregistering pci device\n", __LINE__);
+			pci_unregister_driver(&cnss_wlan_pci_driver);
+			penv->pdev = NULL;
+			penv->pci_register_again = true;
+		}
 	}
 
 err_wlan_vreg_on:
@@ -2870,7 +2888,9 @@ static int cnss_probe(struct platform_device *pdev)
 	struct esoc_desc *desc;
 	const char *client_desc;
 	struct device *dev = &pdev->dev;
+#ifndef CONFIG_MSM_GVM_QUIN
 	u32 rc_num;
+#endif
 	struct resource *res;
 	u32 ramdump_size = 0;
 	u32 smmu_iova_address[2];
@@ -2905,6 +2925,7 @@ static int cnss_probe(struct platform_device *pdev)
 		goto err_get_rc;
 	}
 
+#ifndef CONFIG_MSM_GVM_QUIN
 	ret = of_property_read_u32(dev->of_node, "qcom,wlan-rc-num", &rc_num);
 	if (ret) {
 		pr_err("%s: Failed to find PCIe RC number!\n", __func__);
@@ -2916,6 +2937,7 @@ static int cnss_probe(struct platform_device *pdev)
 		pr_err("%s: Failed to enable PCIe RC%x!\n", __func__, rc_num);
 		goto err_pcie_enumerate;
 	}
+#endif
 
 	penv->pcie_link_state = PCIE_LINK_UP;
 
@@ -3096,7 +3118,9 @@ err_subsys_reg:
 		devm_unregister_esoc_client(&pdev->dev, penv->esoc_desc);
 
 err_esoc_reg:
+#ifndef CONFIG_MSM_GVM_QUIN
 err_pcie_enumerate:
+#endif
 err_get_rc:
 	cnss_configure_wlan_en_gpio(WLAN_EN_LOW);
 	cnss_wlan_release_resources();

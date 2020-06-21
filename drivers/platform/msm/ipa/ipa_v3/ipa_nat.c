@@ -382,6 +382,7 @@ int ipa3_nat_init_cmd(struct ipa_ioc_v4_nat_init *init)
 		IPAERR_RL("Detected overflow\n");
 		return -EPERM;
 	}
+
 	mutex_lock(&ipa3_ctx->nat_mem.lock);
 
 	/* Check Table Entry offset is not
@@ -771,13 +772,11 @@ void ipa3_nat_free_mem_and_device(struct ipa3_nat_mem *nat_ctx)
 
 	if (nat_ctx->is_sys_mem) {
 		IPADBG("freeing the dma memory\n");
-		if (nat_ctx->vaddr) {
-			dma_free_coherent(
-				ipa3_ctx->pdev, nat_ctx->size,
-				nat_ctx->vaddr, nat_ctx->dma_handle);
-			nat_ctx->size = 0;
-			nat_ctx->vaddr = NULL;
-		}
+		dma_free_coherent(
+			 ipa3_ctx->pdev, nat_ctx->size,
+			 nat_ctx->vaddr, nat_ctx->dma_handle);
+		nat_ctx->size = 0;
+		nat_ctx->vaddr = NULL;
 	}
 	nat_ctx->is_mapped = false;
 	nat_ctx->is_sys_mem = false;
