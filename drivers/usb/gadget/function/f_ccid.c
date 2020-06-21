@@ -121,7 +121,7 @@ static struct usb_ccid_class_descriptor ccid_class_desc = {
 	.dwSynchProtocols =	0,
 	.dwMechanical =		0,
 	/* This value indicates what intelligent features the CCID has */
-	.dwFeatures =		CCID_FEATURES_EXC_SAPDU |
+	.dwFeatures =		CCID_FEATURES_EXC_TPDU |
 				CCID_FEATURES_AUTO_PNEGO |
 				CCID_FEATURES_AUTO_BAUD |
 				CCID_FEATURES_AUTO_CLOCK |
@@ -855,9 +855,9 @@ static ssize_t ccid_bulk_write(struct file *fp, const char __user *buf,
 						&bulk_dev->tx_idle)))
 				ccid_request_free(req, ccid_dev->in);
 			r = -ENODEV;
+			goto done;
 		}
 		spin_unlock_irqrestore(&ccid_dev->lock, flags);
-		goto done;
 	}
 done:
 	pr_debug("ccid_bulk_write returning %d\n", r);

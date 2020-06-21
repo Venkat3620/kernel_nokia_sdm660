@@ -89,6 +89,8 @@ struct f_midi {
 	unsigned int buflen, qlen;
 };
 
+static struct f_midi *the_midi;
+
 static inline struct f_midi *func_to_midi(struct usb_function *f)
 {
 	return container_of(f, struct f_midi, func);
@@ -207,7 +209,7 @@ static struct usb_gadget_strings *midi_strings[] = {
 static inline struct usb_request *midi_alloc_ep_req(struct usb_ep *ep,
 						    unsigned length)
 {
-	return alloc_ep_req(ep, length, length);
+	return alloc_ep_req(ep, length);
 }
 
 static const uint8_t f_midi_cin_length[] = {
@@ -373,9 +375,11 @@ static int f_midi_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 		req->complete = f_midi_complete;
 		err = usb_ep_queue(midi->out_ep, req, GFP_ATOMIC);
 		if (err) {
-			ERROR(midi, "%s queue req: %d\n",
+			ERROR(midi, "%s: couldn't enqueue request: %d\n",
 				    midi->out_ep->name, err);
-			free_ep_req(midi->out_ep, req);
+			if (req->buf != NULL)
+				free_ep_req(midi->out_ep, req);
+			return err;
 		}
 	}
 
@@ -573,6 +577,10 @@ static int f_midi_in_open(struct snd_rawmidi_substream *substream)
 {
 	struct f_midi *midi = substream->rmidi->private_data;
 
+ /* check if midi got disabled or re-enabled quickly */
+ if (midi != the_midi)
+ return -ENODEV;
+
 	if (!midi->in_port[substream->number])
 		return -EINVAL;
 
@@ -594,6 +602,10 @@ static void f_midi_in_trigger(struct snd_rawmidi_substream *substream, int up)
 {
 	struct f_midi *midi = substream->rmidi->private_data;
 
+ /* check if midi got disabled or re-enabled quickly */
+ if (midi != the_midi)
+ return;
+
 	if (!midi->in_port[substream->number])
 		return;
 
@@ -606,6 +618,10 @@ static void f_midi_in_trigger(struct snd_rawmidi_substream *substream, int up)
 static int f_midi_out_open(struct snd_rawmidi_substream *substream)
 {
 	struct f_midi *midi = substream->rmidi->private_data;
+
+ /* check if midi got disabled or re-enabled quickly */
+ if (midi != the_midi)
+ return -ENODEV;
 
 	if (substream->number >= MAX_PORTS)
 		return -EINVAL;
@@ -626,6 +642,10 @@ static int f_midi_out_close(struct snd_rawmidi_substream *substream)
 static void f_midi_out_trigger(struct snd_rawmidi_substream *substream, int up)
 {
 	struct f_midi *midi = substream->rmidi->private_data;
+
+ /* check if midi got disabled or re-enabled quickly */
+ if (midi != the_midi)
+ return;
 
 	VDBG(midi, "%s()\n", __func__);
 
@@ -1190,6 +1210,7 @@ static void f_midi_free(struct usb_function *f)
 		kfree(midi->in_port[i]);
 	opts->func_inst.f = NULL;
 	kfree(midi);
+	the_midi = NULL;
 	opts->func_inst.f = NULL;
 	--opts->refcnt;
 	mutex_unlock(&opts->lock);
@@ -1212,6 +1233,8 @@ static void f_midi_unbind(struct usb_configuration *c, struct usb_function *f)
 		snd_card_free_when_closed(card);
 
 	usb_free_all_descriptors(f);
+     //kfree(midi);
+ //the_midi = NULL;
 }
 
 static struct usb_function *f_midi_alloc(struct usb_function_instance *fi)
@@ -1272,6 +1295,8 @@ static struct usb_function *f_midi_alloc(struct usb_function_instance *fi)
 	midi->func.set_alt	= f_midi_set_alt;
 	midi->func.disable	= f_midi_disable;
 	midi->func.free_func	= f_midi_free;
+
+	the_midi = midi;
 
 	fi->f = &midi->func;
 	return &midi->func;

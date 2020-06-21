@@ -552,6 +552,9 @@ static int ipa_suspend_work_handler(struct gsi_data_port *d_port)
 	if (!usb_gsi_ep_op(gsi->d_port.in_ep, (void *) &f_suspend,
 				GSI_EP_OP_CHECK_FOR_SUSPEND)) {
 		ret = -EFAULT;
+		block_db = false;
+		usb_gsi_ep_op(d_port->in_ep, (void *)&block_db,
+			GSI_EP_OP_SET_CLR_BLOCK_DBL);
 		goto done;
 	}
 
@@ -879,8 +882,9 @@ static void gsi_ctrl_clear_cpkt_queues(struct f_gsi *gsi, bool skip_req_q)
 {
 	struct gsi_ctrl_pkt *cpkt = NULL;
 	struct list_head *act, *tmp;
+	unsigned long flags;
 
-	spin_lock(&gsi->c_port.lock);
+	spin_lock_irqsave(&gsi->c_port.lock, flags);
 	if (skip_req_q)
 		goto clean_resp_q;
 
@@ -895,7 +899,7 @@ clean_resp_q:
 		list_del(&cpkt->list);
 		gsi_ctrl_pkt_free(cpkt);
 	}
-	spin_unlock(&gsi->c_port.lock);
+	spin_unlock_irqrestore(&gsi->c_port.lock, flags);
 }
 
 static int gsi_ctrl_send_cpkt_tomodem(struct f_gsi *gsi, void *buf, size_t len)
@@ -2839,16 +2843,13 @@ static void gsi_unbind(struct usb_configuration *c, struct usb_function *f)
 	if (gsi->prot_id == IPA_USB_MBIM)
 		mbim_gsi_ext_config_desc.function.subCompatibleID[0] = 0;
 
-	if (gadget_is_superspeed(c->cdev->gadget)) {
+	if (gadget_is_superspeed(c->cdev->gadget))
 		usb_free_descriptors(f->ss_descriptors);
-		f->ss_descriptors = NULL;
-	}
-	if (gadget_is_dualspeed(c->cdev->gadget)) {
+
+	if (gadget_is_dualspeed(c->cdev->gadget))
 		usb_free_descriptors(f->hs_descriptors);
-		f->hs_descriptors = NULL;
-	}
+
 	usb_free_descriptors(f->fs_descriptors);
-	f->fs_descriptors = NULL;
 
 	if (gsi->c_port.notify) {
 		kfree(gsi->c_port.notify_req->buf);
@@ -3197,7 +3198,6 @@ static int gsi_set_inst_name(struct usb_function_instance *fi,
 	if (prot_id == IPA_USB_RNDIS)
 		config_group_init_type_name(&opts->func_inst.group, "",
 					    &gsi_func_rndis_type);
-
 	gsi = gsi_function_init(prot_id);
 	if (IS_ERR(gsi))
 		return PTR_ERR(gsi);
