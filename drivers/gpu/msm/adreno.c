@@ -1,4 +1,4 @@
-/* Copyright (c) 2002,2007-2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2002,2007-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -41,6 +41,8 @@
 /* Include the master list of GPU cores that are supported */
 #include "adreno-gpulist.h"
 #include "adreno_dispatch.h"
+
+#include <soc/qcom/boot_stats.h>
 
 #undef MODULE_PARAM_PREFIX
 #define MODULE_PARAM_PREFIX "adreno."
@@ -807,13 +809,13 @@ static int adreno_of_get_pwrlevels(struct adreno_device *adreno_dev,
 		struct device_node *parent)
 {
 	struct device_node *node, *child;
+	unsigned int bin = 0;
 
 	node = of_find_node_by_name(parent, "qcom,gpu-pwrlevel-bins");
 	if (node == NULL)
 		return adreno_of_get_legacy_pwrlevels(adreno_dev, parent);
 
 	for_each_child_of_node(node, child) {
-		unsigned int bin;
 
 		if (of_property_read_u32(child, "qcom,speed-bin", &bin))
 			continue;
@@ -829,6 +831,8 @@ static int adreno_of_get_pwrlevels(struct adreno_device *adreno_dev,
 		}
 	}
 
+	KGSL_CORE_ERR("GPU speed_bin:%d mismatch for efused bin:%d\n",
+			adreno_dev->speed_bin, bin);
 	return -ENODEV;
 }
 
@@ -1033,6 +1037,9 @@ static int adreno_probe(struct platform_device *pdev)
 		}
 	}
 #endif
+
+	place_marker("M - DRIVER GPU Ready");
+
 out:
 	if (status) {
 		adreno_ringbuffer_close(adreno_dev);
@@ -1160,6 +1167,10 @@ static int adreno_init(struct kgsl_device *device)
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 	struct adreno_gpudev *gpudev = ADRENO_GPU_DEVICE(adreno_dev);
 	int ret;
+
+	if (!adreno_is_a3xx(adreno_dev))
+		kgsl_sharedmem_set(device, &device->scratch, 0, 0,
+				device->scratch.size);
 
 	ret = kgsl_pwrctrl_change_state(device, KGSL_STATE_INIT);
 	if (ret)
@@ -1909,6 +1920,26 @@ static int adreno_getproperty(struct kgsl_device *device,
 			bitness = 48;
 
 		if (copy_to_user(value, &bitness,
+				sizeof(unsigned int))) {
+			status = -EFAULT;
+			break;
+		}
+		status = 0;
+	}
+	break;
+	case KGSL_PROP_IB_TIMEOUT:
+	{
+		unsigned int ib_timeout = adreno_drawobj_timeout;
+
+		if (ib_timeout == 0)
+			return -EINVAL;
+
+		if (sizebytes != sizeof(unsigned int)) {
+			status = -EINVAL;
+			break;
+		}
+
+		if (copy_to_user(value, &ib_timeout,
 				sizeof(unsigned int))) {
 			status = -EFAULT;
 			break;
@@ -2774,6 +2805,28 @@ static void adreno_gpu_model(struct kgsl_device *device, char *str,
 			 ADRENO_CHIPID_PATCH(adreno_dev->chipid) + 1);
 }
 
+static void adreno_suspend_device(struct kgsl_device *device,
+				pm_message_t pm_state)
+{
+	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
+	struct adreno_gpudev *gpudev = ADRENO_GPU_DEVICE(adreno_dev);
+	int pm_event = pm_state.event;
+
+	if (device->state == KGSL_STATE_SUSPEND)
+		adreno_dispatcher_halt(device);
+
+	if ((pm_event == PM_EVENT_FREEZE) ||
+		(pm_event == PM_EVENT_QUIESCE) ||
+		(pm_event == PM_EVENT_HIBERNATE))
+		if (gpudev->zap_shader_unload != NULL)
+			gpudev->zap_shader_unload(adreno_dev);
+}
+
+static void adreno_resume_device(struct kgsl_device *device)
+{
+	adreno_dispatcher_unhalt(device);
+}
+
 static const struct kgsl_functable adreno_functable = {
 	/* Mandatory functions */
 	.regread = adreno_regread,
@@ -2813,6 +2866,8 @@ static const struct kgsl_functable adreno_functable = {
 	.clk_set_options = adreno_clk_set_options,
 	.gpu_model = adreno_gpu_model,
 	.stop_fault_timer = adreno_dispatcher_stop_fault_timer,
+	.suspend_device = adreno_suspend_device,
+	.resume_device = adreno_resume_device,
 };
 
 static struct platform_driver adreno_platform_driver = {

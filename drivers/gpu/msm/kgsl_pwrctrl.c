@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -61,7 +61,7 @@ static const char * const clocks[] = {
 	"iref_clk"
 };
 
-static unsigned int ib_votes[KGSL_MAX_BUSLEVELS];
+static unsigned long ib_votes[KGSL_MAX_BUSLEVELS];
 static int last_vote_buslevel;
 static int max_vote_buslevel;
 
@@ -123,7 +123,7 @@ static void _record_pwrevent(struct kgsl_device *device,
 /**
  * kgsl_get_bw() - Return latest msm bus IB vote
  */
-static unsigned int kgsl_get_bw(void)
+static unsigned long kgsl_get_bw(void)
 {
 	return ib_votes[last_vote_buslevel];
 }
@@ -137,8 +137,9 @@ static unsigned int kgsl_get_bw(void)
 static void _ab_buslevel_update(struct kgsl_pwrctrl *pwr,
 				unsigned long *ab)
 {
-	unsigned int ib = ib_votes[last_vote_buslevel];
-	unsigned int max_bw = ib_votes[max_vote_buslevel];
+	unsigned long ib = ib_votes[last_vote_buslevel];
+	unsigned long max_bw = ib_votes[max_vote_buslevel];
+
 	if (!ab)
 		return;
 	if (ib == 0)
@@ -2124,7 +2125,7 @@ static inline void _close_clks(struct kgsl_device *device)
 
 int kgsl_pwrctrl_init(struct kgsl_device *device)
 {
-	int i, k, m, n = 0, result;
+	int i, k, m, n = 0, result, freq;
 	struct platform_device *pdev = device->pdev;
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
 	struct device_node *ocmem_bus_node;
@@ -2170,7 +2171,7 @@ int kgsl_pwrctrl_init(struct kgsl_device *device)
 	pwr->wakeup_maxpwrlevel = 0;
 
 	for (i = 0; i < pwr->num_pwrlevels; i++) {
-		unsigned int freq = pwr->pwrlevels[i].gpu_freq;
+		freq = pwr->pwrlevels[i].gpu_freq;
 
 		if (freq > 0)
 			freq = clk_round_rate(pwr->grp_clks[0], freq);
@@ -2181,9 +2182,10 @@ int kgsl_pwrctrl_init(struct kgsl_device *device)
 	kgsl_pwrctrl_clk_set_rate(pwr->grp_clks[0],
 		pwr->pwrlevels[pwr->num_pwrlevels - 1].gpu_freq, clocks[0]);
 
-	kgsl_pwrctrl_clk_set_rate(pwr->grp_clks[6],
-		clk_round_rate(pwr->grp_clks[6], KGSL_RBBMTIMER_CLK_FREQ),
-		clocks[6]);
+	freq = clk_round_rate(pwr->grp_clks[6], KGSL_RBBMTIMER_CLK_FREQ);
+	if (freq > 0)
+		kgsl_pwrctrl_clk_set_rate(pwr->grp_clks[6],
+			freq, clocks[6]);
 
 	_isense_clk_set_rate(pwr, pwr->num_pwrlevels - 1);
 
@@ -2674,6 +2676,7 @@ _aware(struct kgsl_device *device)
 		break;
 	default:
 		status = -EINVAL;
+		return status;
 	}
 	if (status)
 		kgsl_pwrctrl_request_state(device, KGSL_STATE_NONE);
@@ -2780,8 +2783,9 @@ static int _suspend(struct kgsl_device *device)
 {
 	int ret = 0;
 
-	if ((KGSL_STATE_NONE == device->state) ||
-			(KGSL_STATE_INIT == device->state))
+	if ((device->state == KGSL_STATE_NONE) ||
+			(device->state == KGSL_STATE_INIT) ||
+			(device->state == KGSL_STATE_SUSPEND))
 		return ret;
 
 	/* drain to prevent from more commands being submitted */
@@ -3175,3 +3179,40 @@ unsigned int kgsl_pwr_limits_get_freq(enum kgsl_deviceid id)
 	return freq;
 }
 EXPORT_SYMBOL(kgsl_pwr_limits_get_freq);
+
+#ifdef CONFIG_FIH_CPU_USAGE
+void kgsl_pwr_quick_get_infos(unsigned int *min, unsigned int *max, unsigned *curr, unsigned *therm)
+{
+/*
+	struct kgsl_device *device = kgsl_get_device(KGSL_DEVICE_3D0);
+	struct kgsl_pwrctrl *pwr;
+*/
+	static struct kgsl_device *device = NULL;
+	struct kgsl_pwrctrl *pwr;
+        int i;
+
+	if (device == NULL) {
+		for (i = 0; i < KGSL_DEVICE_MAX; i++) {
+			if (kgsl_driver.devp[i] && kgsl_driver.devp[i]->id == KGSL_DEVICE_3D0) {
+				device = kgsl_driver.devp[i];
+				break;
+			}
+		}
+	}
+
+	if (IS_ERR_OR_NULL(device))
+		return;
+	pwr = &device->pwrctrl;
+//	mutex_lock(&device->mutex);
+	if (min)
+		*min = pwr->pwrlevels[pwr->min_pwrlevel].gpu_freq / 1000000;
+	if (max)
+		*max = pwr->pwrlevels[pwr->max_pwrlevel].gpu_freq / 1000000;
+	if (curr)
+		*curr = pwr->pwrlevels[pwr->active_pwrlevel].gpu_freq / 1000000;
+	if (therm)
+		*therm = pwr->pwrlevels[pwr->thermal_pwrlevel].gpu_freq / 1000000;
+//	mutex_unlock(&device->mutex);
+}
+EXPORT_SYMBOL(kgsl_pwr_quick_get_infos);
+#endif
