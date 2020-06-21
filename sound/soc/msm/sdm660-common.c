@@ -20,8 +20,15 @@
 #include "sdm660-internal.h"
 #include "sdm660-external.h"
 #include "../codecs/sdm660_cdc/msm-analog-cdc.h"
-#include "../codecs/wsa881x.h"
+#include <linux/proc_fs.h>
 
+#undef USE_QC_SPK_AMP
+#ifdef USE_QC_SPK_AMP
+#include "../codecs/wsa881x.h"
+#endif
+
+#define __CHIPSET__ "SDM660 "
+#define MSM_DAILINK_NAME(name) (__CHIPSET__#name)
 #define DRV_NAME "sdm660-asoc-snd"
 
 #define MSM_INT_DIGITAL_CODEC "msm-dig-codec"
@@ -29,6 +36,9 @@
 
 #define DEV_NAME_STR_LEN  32
 #define DEFAULT_MCLK_RATE 9600000
+#define MSM_LL_QOS_VALUE 300 /* time in us to ensure LPM doesn't go in C3/C4 */
+
+bool ext_spk_amp_support;
 
 struct dev_config {
 	u32 sample_rate;
@@ -133,6 +143,7 @@ static struct dev_config tdm_tx_cfg[TDM_INTERFACE_MAX][TDM_PORT_MAX] = {
 static struct dev_config ext_disp_rx_cfg[] = {
 	[DP_RX_IDX] =   {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 2},
 };
+
 static struct dev_config usb_rx_cfg = {
 	.sample_rate = SAMPLING_RATE_48KHZ,
 	.bit_format = SNDRV_PCM_FORMAT_S16_LE,
@@ -183,31 +194,33 @@ static u32 mi2s_ebit_clk[MI2S_MAX] = {
 	Q6AFE_LPASS_CLK_ID_QUAD_MI2S_EBIT
 };
 
+#ifdef USE_QC_SPK_AMP
 struct msm_wsa881x_dev_info {
 	struct device_node *of_node;
 	u32 index;
 };
 static struct snd_soc_aux_dev *msm_aux_dev;
 static struct snd_soc_codec_conf *msm_codec_conf;
+#endif
 
 static bool msm_swap_gnd_mic(struct snd_soc_codec *codec);
 
 static struct wcd_mbhc_config mbhc_cfg = {
 	.read_fw_bin = false,
 	.calibration = NULL,
-	.detect_extn_cable = true,
+	.detect_extn_cable = false,
 	.mono_stero_detection = false,
 	.swap_gnd_mic = NULL,
 	.hs_ext_micbias = true,
 	.key_code[0] = KEY_MEDIA,
-	.key_code[1] = KEY_VOICECOMMAND,
-	.key_code[2] = KEY_VOLUMEUP,
-	.key_code[3] = KEY_VOLUMEDOWN,
+	.key_code[1] = KEY_VOLUMEUP,
+	.key_code[2] = KEY_VOLUMEDOWN,
+	.key_code[3] = 0,
 	.key_code[4] = 0,
 	.key_code[5] = 0,
 	.key_code[6] = 0,
 	.key_code[7] = 0,
-	.linein_th = 5000,
+	.linein_th = 27000,
 	.moisture_en = false,
 	.mbhc_micbias = 0,
 	.anc_micbias = 0,
@@ -224,7 +237,7 @@ static struct dev_config proxy_rx_cfg = {
 static struct dev_config mi2s_rx_cfg[] = {
 	[PRIM_MI2S] = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 2},
 	[SEC_MI2S]  = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 2},
-	[TERT_MI2S] = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 2},
+	[TERT_MI2S] = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 1},
 	[QUAT_MI2S] = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 2},
 };
 
@@ -278,6 +291,7 @@ static char const *usb_sample_rate_text[] = {"KHZ_8", "KHZ_11P025",
 static char const *ext_disp_bit_format_text[] = {"S16_LE", "S24_LE"};
 static char const *ext_disp_sample_rate_text[] = {"KHZ_48", "KHZ_96",
 						  "KHZ_192"};
+static const char *const qos_text[] = {"Disable", "Enable"};
 
 static SOC_ENUM_SINGLE_EXT_DECL(ext_disp_rx_chs, ch_text);
 static SOC_ENUM_SINGLE_EXT_DECL(proxy_rx_chs, ch_text);
@@ -328,6 +342,9 @@ static SOC_ENUM_SINGLE_EXT_DECL(tdm_tx_sample_rate, tdm_sample_rate_text);
 static SOC_ENUM_SINGLE_EXT_DECL(tdm_rx_chs, tdm_ch_text);
 static SOC_ENUM_SINGLE_EXT_DECL(tdm_rx_format, tdm_bit_format_text);
 static SOC_ENUM_SINGLE_EXT_DECL(tdm_rx_sample_rate, tdm_sample_rate_text);
+static SOC_ENUM_SINGLE_EXT_DECL(qos_vote, qos_text);
+
+static int qos_vote_status;
 
 static struct afe_clk_set mi2s_clk[MI2S_MAX] = {
 	{
@@ -1816,6 +1833,55 @@ static int ext_disp_rx_sample_rate_put(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
+static int msm_qos_ctl_get(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_value *ucontrol)
+{
+	ucontrol->value.enumerated.item[0] = qos_vote_status;
+	return 0;
+}
+
+static int msm_qos_ctl_put(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
+	struct snd_soc_card *card = codec->component.card;
+	const char *fe_name = MSM_DAILINK_NAME(LowLatency);
+	struct snd_soc_pcm_runtime *rtd;
+	struct snd_pcm_substream *substream;
+	s32 usecs;
+
+	rtd = snd_soc_get_pcm_runtime(card, fe_name);
+	if (!rtd) {
+		pr_err("%s: fail to get pcm runtime for %s\n",
+			__func__, fe_name);
+		return -EINVAL;
+	}
+
+	substream = rtd->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
+	if (!substream) {
+		pr_err("%s: substream is null\n", __func__);
+		return -EINVAL;
+	}
+
+	qos_vote_status = ucontrol->value.enumerated.item[0];
+	if (qos_vote_status) {
+		if (pm_qos_request_active(&substream->latency_pm_qos_req))
+			pm_qos_remove_request(&substream->latency_pm_qos_req);
+		if (!substream->runtime) {
+			pr_err("%s: runtime is null\n", __func__);
+			return -EINVAL;
+		}
+		usecs = MSM_LL_QOS_VALUE;
+		if (usecs >= 0)
+			pm_qos_add_request(&substream->latency_pm_qos_req,
+						PM_QOS_CPU_DMA_LATENCY, usecs);
+	} else {
+		if (pm_qos_request_active(&substream->latency_pm_qos_req))
+			pm_qos_remove_request(&substream->latency_pm_qos_req);
+	}
+	return 0;
+}
+
 const struct snd_kcontrol_new msm_common_snd_controls[] = {
 	SOC_ENUM_EXT("PROXY_RX Channels", proxy_rx_chs,
 			proxy_rx_ch_get, proxy_rx_ch_put),
@@ -2000,6 +2066,10 @@ const struct snd_kcontrol_new msm_common_snd_controls[] = {
 	SOC_ENUM_EXT("QUAT_TDM_TX_0 Channels", tdm_tx_chs,
 			tdm_tx_ch_get,
 			tdm_tx_ch_put),
+
+	SOC_ENUM_EXT("MultiMedia5_RX QOS Vote", qos_vote, msm_qos_ctl_get,
+			msm_qos_ctl_put),
+
 };
 
 /**
@@ -2464,6 +2534,7 @@ int msm_mi2s_snd_startup(struct snd_pcm_substream *substream)
 	int port_id = msm_get_port_id(rtd->dai_link->be_id);
 	int index = cpu_dai->id;
 	unsigned int fmt = SND_SOC_DAIFMT_CBS_CFS;
+	struct msm_asoc_mach_data *pdata = snd_soc_card_get_drvdata(rtd->card);
 
 	dev_dbg(rtd->card->dev,
 		"%s: substream = %s  stream = %d, dai name %s, dai ID %d\n",
@@ -2515,6 +2586,10 @@ int msm_mi2s_snd_startup(struct snd_pcm_substream *substream)
 				goto clk_off;
 			}
 		}
+		if ((index == TERT_MI2S) && (pdata->tert_mi2s_gpio_p)) {
+			msm_cdc_pinctrl_select_active_state(pdata->tert_mi2s_gpio_p);
+			pr_debug("%s: active Tertiary MI2S gpios\n", __func__);
+		}
 	}
 	mutex_unlock(&mi2s_intf_conf[index].lock);
 	return 0;
@@ -2541,6 +2616,7 @@ void msm_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
 	int port_id = msm_get_port_id(rtd->dai_link->be_id);
 	int index = rtd->cpu_dai->id;
+	struct msm_asoc_mach_data *pdata = snd_soc_card_get_drvdata(rtd->card);
 
 	pr_debug("%s(): substream = %s  stream = %d\n", __func__,
 		 substream->name, substream->stream);
@@ -2551,6 +2627,10 @@ void msm_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 
 	mutex_lock(&mi2s_intf_conf[index].lock);
 	if (--mi2s_intf_conf[index].ref_cnt == 0) {
+		if ((index == TERT_MI2S) && (pdata->tert_mi2s_gpio_p)) {
+			msm_cdc_pinctrl_select_sleep_state(pdata->tert_mi2s_gpio_p);
+			pr_debug("%s: sleep Tertiary MI2S gpios\n", __func__);
+		}
 		ret = msm_mi2s_set_sclk(substream, false);
 		if (ret < 0)
 			pr_err("%s:clock disable failed for MI2S (%d); ret=%d\n",
@@ -2570,6 +2650,40 @@ void msm_mi2s_snd_shutdown(struct snd_pcm_substream *substream)
 	mutex_unlock(&mi2s_intf_conf[index].lock);
 }
 EXPORT_SYMBOL(msm_mi2s_snd_shutdown);
+
+static int fih_ext_spk_amp_read_show(struct seq_file *m, void *v)
+{
+	if(ext_spk_amp_support)
+		seq_printf(m, "Support\n");
+	else
+		seq_printf(m, "Not Support\n");
+	return 0;
+}
+
+static int fih_ext_spk_amp_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, fih_ext_spk_amp_read_show, NULL);
+}
+
+static struct file_operations ext_spk_amp_file_ops = {
+	.owner   = THIS_MODULE,
+	.open    = fih_ext_spk_amp_proc_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release
+};
+
+static int fih_ext_spk_amp_init(void)
+{
+	if (proc_create("AllHWList/ExtSpkAmp", 0, NULL, &ext_spk_amp_file_ops) == NULL) {
+		proc_mkdir("AllHWList", NULL);
+		if (proc_create("AllHWList/ExtSpkAmp", 0, NULL, &ext_spk_amp_file_ops) == NULL) {
+			pr_err("%s: fail to create proc/%s\n", __func__, "AllHWList/ExtSpkAmp");
+			return 1;
+		}
+	}
+	return 0;
+}
 
 /* Validate whether US EU switch is present or not */
 static int msm_prepare_us_euro(struct snd_soc_card *card)
@@ -2726,6 +2840,7 @@ err:
 	return ret;
 }
 
+#ifdef USE_QC_SPK_AMP
 static int msm_wsa881x_init(struct snd_soc_component *component)
 {
 	u8 spkleft_ports[WSA881X_MAX_SWR_PORTS] = {100, 101, 102, 106};
@@ -2976,6 +3091,7 @@ static void msm_free_auxdev_mem(struct platform_device *pdev)
 		}
 	}
 }
+#endif
 
 static void i2s_auxpcm_init(struct platform_device *pdev)
 {
@@ -3085,6 +3201,15 @@ static int msm_asoc_machine_probe(struct platform_device *pdev)
 		pdata->ext_spk_gpio_p = of_parse_phandle(pdev->dev.of_node,
 					"qcom,cdc-ext-spk-gpios", 0);
 	}
+	/* read Tertiary MI2S gpio configurations from dtsi file */
+	pdata->tert_mi2s_gpio_p = of_parse_phandle(pdev->dev.of_node,
+				"qcom,tert-mi2s-gpios", 0);
+	if (!pdata->tert_mi2s_gpio_p) {
+		dev_dbg(&pdev->dev, "property %s not detected in node %s",
+			"qcom,tert-mi2s-gpios", pdev->dev.of_node->full_name);
+	} else {
+		dev_dbg(&pdev->dev, "%s detected", "qcom,tert-mi2s-gpios");
+	}
 
 	/*
 	 * Parse US-Euro gpio info from DT. Report no error if us-euro
@@ -3122,11 +3247,13 @@ static int msm_asoc_machine_probe(struct platform_device *pdev)
 		goto err;
 	}
 
+#ifdef USE_QC_SPK_AMP
 	if (!of_property_read_bool(pdev->dev.of_node, "qcom,wsa-disable")) {
 		ret = msm_init_wsa_dev(pdev, card);
 		if (ret)
 			goto err;
 	}
+#endif
 
 	ret = devm_snd_soc_register_card(&pdev->dev, card);
 	if (ret == -EPROBE_DEFER) {
@@ -3144,8 +3271,12 @@ static int msm_asoc_machine_probe(struct platform_device *pdev)
 			ret);
 		goto err;
 	}
+
 	if (pdata->snd_card_val != INT_SND_CARD)
 		msm_ext_register_audio_notifier(pdev);
+
+	ext_spk_amp_support = of_property_read_bool(pdev->dev.of_node, "fih,ext-spk-amp-support");
+	fih_ext_spk_amp_init();
 
 	return 0;
 err:
@@ -3181,7 +3312,10 @@ static int msm_asoc_machine_remove(struct platform_device *pdev)
 		mutex_destroy(&pdata->cdc_int_mclk0_mutex);
 	else
 		msm_ext_cdc_deinit(pdata);
+
+#ifdef USE_QC_SPK_AMP
 	msm_free_auxdev_mem(pdev);
+#endif
 
 	gpio_free(pdata->us_euro_gpio);
 	gpio_free(pdata->hph_en1_gpio);
